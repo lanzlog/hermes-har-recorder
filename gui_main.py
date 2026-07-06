@@ -592,6 +592,18 @@ class HARRecorderWindow(QMainWindow):
         act_extract.triggered.connect(self._extract_all_tokens)
         tools_menu.addAction(act_extract)
 
+        # Settings menu
+        settings_menu = menubar.addMenu("Settings")
+        act_port = QAction("Change Proxy Port...", self)
+        act_port.triggered.connect(self._change_port)
+        settings_menu.addAction(act_port)
+
+        self.act_auto_proxy = QAction("Auto-set System Proxy", self)
+        self.act_auto_proxy.setCheckable(True)
+        self.act_auto_proxy.setChecked(self.config.get("auto_set_proxy", True))
+        self.act_auto_proxy.triggered.connect(self._toggle_auto_proxy)
+        settings_menu.addAction(self.act_auto_proxy)
+
         # Help menu
         help_menu = menubar.addMenu("Help")
         act_about = QAction("About", self)
@@ -774,17 +786,24 @@ class HARRecorderWindow(QMainWindow):
 
         if self._proxy_engine.start():
             self._recording = True
+            actual_port = self._proxy_engine.port
             self.btn_record.setEnabled(False)
             self.btn_stop.setEnabled(True)
-            self.lbl_proxy.setText(f"🟢 Proxy: :{port}")
+            self.lbl_proxy.setText(f"🟢 Proxy: :{actual_port}")
             self.lbl_proxy.setStyleSheet("color: #98C379;")
-            self.statusBar().showMessage(f"Recording on port {port}")
+            if actual_port != port:
+                self.statusBar().showMessage(f"Port {port} busy, using {actual_port}")
+            else:
+                self.statusBar().showMessage(f"Recording on port {actual_port}")
 
             # Auto-set system proxy on Windows
             if self.config.get("auto_set_proxy", True):
-                set_system_proxy(port)
+                set_system_proxy(actual_port)
         else:
-            QMessageBox.warning(self, "Error", "Failed to start proxy. Port may be in use.")
+            QMessageBox.warning(self, "Error", 
+                f"Failed to start proxy on port {port}.\n"
+                f"Port and nearby ports (8899-8918) are all in use.\n\n"
+                f"Try closing other proxy tools or change port in Settings.")
 
     def _emit_flow(self, captured: CapturedRequest):
         """Thread-safe flow emission."""
@@ -1473,6 +1492,23 @@ class HARRecorderWindow(QMainWindow):
         self.setWindowFlags(flags)
         self.show()
         self.config["always_on_top"] = checked
+        save_config(self.config)
+
+    def _change_port(self):
+        """Change proxy port."""
+        from PyQt6.QtWidgets import QInputDialog
+        current = self.config.get("proxy_port", 8899)
+        port, ok = QInputDialog.getInt(
+            self, "Proxy Port", "Enter proxy port:", current, 1024, 65535
+        )
+        if ok:
+            self.config["proxy_port"] = port
+            save_config(self.config)
+            self.statusBar().showMessage(f"Port changed to {port}. Restart recording to apply.")
+
+    def _toggle_auto_proxy(self, checked):
+        """Toggle auto-set system proxy."""
+        self.config["auto_set_proxy"] = checked
         save_config(self.config)
 
     def _show_about(self):

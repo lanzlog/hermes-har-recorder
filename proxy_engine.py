@@ -176,6 +176,7 @@ class ProxyEngine:
     def __init__(self, port: int = 8899, on_flow: Optional[Callable] = None,
                  on_error: Optional[Callable] = None, cert_dir: Optional[str] = None):
         self.port = port
+        self._original_port = port
         self.on_flow = on_flow
         self.on_error = on_error
         self._master: Optional[DumpMaster] = None
@@ -184,6 +185,26 @@ class ProxyEngine:
         self._running = False
         self._addon = HARCaptureAddon(on_flow_complete=self._handle_flow)
         self._cert_dir = cert_dir or str(Path.home() / ".hermes-har-recorder" / "certs")
+
+    @staticmethod
+    def is_port_available(port: int) -> bool:
+        """Check if a port is available for use."""
+        import socket
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                s.bind(('127.0.0.1', port))
+                return True
+        except OSError:
+            return False
+
+    def find_available_port(self, start_port: int = 8899, max_tries: int = 20) -> int:
+        """Find an available port starting from start_port."""
+        for i in range(max_tries):
+            port = start_port + i
+            if self.is_port_available(port):
+                return port
+        return start_port  # fallback
 
     def _handle_flow(self, captured: CapturedRequest):
         """Forward captured flow to the callback (called from proxy thread)."""
@@ -195,6 +216,19 @@ class ProxyEngine:
         """Start the proxy in a background thread."""
         if self._running:
             return True
+
+        # Auto-find available port if default is busy
+        if not self.is_port_available(self.port):
+            new_port = self.find_available_port(self.port)
+            if new_port != self.port:
+                print(f"[ProxyEngine] Port {self.port} busy, using {new_port}")
+                self.port = new_port
+            else:
+                err = f"Port {self.port} and nearby ports are all in use"
+                print(f"[ProxyEngine] {err}")
+                if self.on_error:
+                    self.on_error(err)
+                return False
 
         # Ensure cert directory exists
         Path(self._cert_dir).mkdir(parents=True, exist_ok=True)
