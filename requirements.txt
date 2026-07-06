@@ -1,0 +1,7 @@
+PyQt6>=6.5.0
+PyQt6-Qt6>=6.5.0
+PyQt6-sip>=13.5.0
+mitmproxy>=10.0.0
+requests>=2.31.0
+cryptography>=41.0.0
+pyinstaller>=6.0.0
