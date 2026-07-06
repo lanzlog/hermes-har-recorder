@@ -59,10 +59,10 @@ def build():
     result = subprocess.run(args, capture_output=False)
 
     if result.returncode != 0:
-        print("\n❌ Build failed!")
+        print("\nBuild failed!")
         sys.exit(1)
 
-    print("\n✅ Build successful!")
+    print("\nBuild successful!")
     print(f"Output: {Path('dist/HermesHARRecorder').absolute()}")
 
     # Create a portable zip
@@ -75,7 +75,7 @@ def build():
             root_dir='dist',
             base_dir='HermesHARRecorder'
         )
-        print(f"✅ Created dist/{zip_name}.zip")
+        print(f"Created dist/{zip_name}.zip")
 
 
 def build_onefile():
@@ -109,9 +109,9 @@ def build_onefile():
 
     result = subprocess.run(args, capture_output=False)
     if result.returncode != 0:
-        print("\n❌ Build failed!")
+        print("\nBuild failed!")
         sys.exit(1)
-    print("\n✅ Single-file build successful!")
+    print("\n[OK] Single-file build successful!")
 
 
 def get_version():
