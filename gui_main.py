@@ -587,21 +587,26 @@ class HARRecorderWindow(QMainWindow):
         sep.setFixedWidth(8)
         toolbar_layout.addWidget(sep)
 
-        # Mode toggle buttons
-        self.btn_har_mode = QPushButton("🔵 HAR Mode")
-        self.btn_har_mode.setToolTip("Passive recording mode - captures all traffic")
-        self.btn_har_mode.setFixedHeight(36)
-        self.btn_har_mode.setCheckable(True)
-        self.btn_har_mode.setChecked(True)
-        self.btn_har_mode.setStyleSheet("font-weight:bold; padding: 6px 12px; background-color: #3E4451;")
-        toolbar_layout.addWidget(self.btn_har_mode)
+        # Mode buttons (4 modes)
+        self._mode_buttons = {}
+        modes = [
+            ("record", "⚪ Record", "Basic recording - capture all traffic"),
+            ("har_record", "🔵 HAR", "Record + HAR export"),
+            ("api_trace", "🟣 Trace", "Intercept API requests only"),
+            ("har_trace", "🟢 HAR+Trace", "Record HAR + intercept API"),
+        ]
+        for mode_id, label, tooltip in modes:
+            btn = QPushButton(label)
+            btn.setToolTip(tooltip)
+            btn.setFixedHeight(36)
+            btn.setCheckable(True)
+            btn.setStyleSheet("font-weight:bold; padding: 6px 10px;")
+            toolbar_layout.addWidget(btn)
+            self._mode_buttons[mode_id] = btn
 
-        self.btn_trace_mode = QPushButton("🟣 Trace Mode")
-        self.btn_trace_mode.setToolTip("Active intercept mode - pause & inspect requests")
-        self.btn_trace_mode.setFixedHeight(36)
-        self.btn_trace_mode.setCheckable(True)
-        self.btn_trace_mode.setStyleSheet("font-weight:bold; padding: 6px 12px;")
-        toolbar_layout.addWidget(self.btn_trace_mode)
+        # Default: HAR Record mode
+        self._mode_buttons["har_record"].setChecked(True)
+        self._mode_buttons["har_record"].setStyleSheet("font-weight:bold; padding: 6px 10px; background-color: #3E4451;")
 
         # Separator
         sep2 = QLabel("|")
@@ -746,16 +751,17 @@ class HARRecorderWindow(QMainWindow):
 
         splitter.setSizes([400, 350])
 
-        # Wrap HAR view and trace view in a stacked widget
-        from PyQt6.QtWidgets import QStackedWidget
-        self._stacked_widget = QStackedWidget()
-        self._stacked_widget.addWidget(splitter)  # index 0 = HAR mode
+        # Store HAR view reference
+        self._har_view = splitter
 
-        # ── Trace Panel (index 1) ──
+        # ── Trace Panel ──
         self._trace_panel = self._build_trace_panel()
-        self._stacked_widget.addWidget(self._trace_panel)  # index 1 = Trace mode
+        self._trace_panel.setVisible(False)
 
-        main_layout.addWidget(self._stacked_widget)
+        # Add both to main layout (visibility controlled by mode switching)
+        main_layout.addWidget(self._har_view, stretch=3)
+        main_layout.addWidget(self._trace_panel, stretch=2)
+
 
         # ── Menu Bar ──
         self._build_menu_bar()
@@ -815,15 +821,18 @@ class HARRecorderWindow(QMainWindow):
 
         view_menu.addSeparator()
 
-        act_har_mode = QAction("HAR Record Mode", self)
-        act_har_mode.setShortcut(QKeySequence("Ctrl+1"))
-        act_har_mode.triggered.connect(self._switch_to_har_mode)
-        view_menu.addAction(act_har_mode)
-
-        act_trace_mode = QAction("API Trace Mode", self)
-        act_trace_mode.setShortcut(QKeySequence("Ctrl+2"))
-        act_trace_mode.triggered.connect(self._switch_to_trace_mode)
-        view_menu.addAction(act_trace_mode)
+        view_menu.addSeparator()
+        mode_shortcuts = [
+            ("record", "Record Mode", "Ctrl+1"),
+            ("har_record", "HAR Record Mode", "Ctrl+2"),
+            ("api_trace", "API Trace Mode", "Ctrl+3"),
+            ("har_trace", "HAR + Trace Mode", "Ctrl+4"),
+        ]
+        for mode_id, label, shortcut in mode_shortcuts:
+            act = QAction(label, self)
+            act.setShortcut(QKeySequence(shortcut))
+            act.triggered.connect(lambda checked, m=mode_id: self._switch_mode(m))
+            view_menu.addAction(act)
 
         # Tools menu
         tools_menu = menubar.addMenu("Tools")
@@ -869,8 +878,8 @@ class HARRecorderWindow(QMainWindow):
         self.btn_export.clicked.connect(self._on_export)
 
         # Mode toggle
-        self.btn_har_mode.clicked.connect(self._switch_to_har_mode)
-        self.btn_trace_mode.clicked.connect(self._switch_to_trace_mode)
+        for mode_id, btn in self._mode_buttons.items():
+            btn.clicked.connect(lambda checked, m=mode_id: self._switch_mode(m))
 
         self.flow_received.connect(self._on_flow_received)
         self.proxy_error.connect(self._on_proxy_error)
@@ -1436,38 +1445,59 @@ class HARRecorderWindow(QMainWindow):
 
     # ─── Mode Switching ──────────────────────────────────────────────────────
 
-    def _switch_to_har_mode(self):
-        """Switch to HAR Record mode."""
-        self._app_mode = AppMode.HAR_RECORD
-        self.btn_har_mode.setChecked(True)
-        self.btn_trace_mode.setChecked(False)
-        self.btn_har_mode.setStyleSheet("font-weight:bold; padding: 6px 12px; background-color: #3E4451;")
-        self.btn_trace_mode.setStyleSheet("font-weight:bold; padding: 6px 12px;")
-        self._stacked_widget.setCurrentIndex(0)
-        self._filter_bar_widget.setVisible(True)
+    def _switch_mode(self, mode_id: str):
+        """Switch to specified mode."""
+        mode_map = {
+            "record": AppMode.RECORD,
+            "har_record": AppMode.HAR_RECORD,
+            "api_trace": AppMode.API_TRACE,
+            "har_trace": AppMode.HAR_TRACE,
+        }
+        self._app_mode = mode_map.get(mode_id, AppMode.HAR_RECORD)
+
+        # Update button styles
+        for mid, btn in self._mode_buttons.items():
+            if mid == mode_id:
+                btn.setChecked(True)
+                btn.setStyleSheet("font-weight:bold; padding: 6px 10px; background-color: #3E4451;")
+            else:
+                btn.setChecked(False)
+                btn.setStyleSheet("font-weight:bold; padding: 6px 10px;")
+
+        # Show/hide panels based on mode
+        has_trace = mode_id in ("api_trace", "har_trace")
+        has_har = mode_id in ("record", "har_record", "har_trace")
+        is_combined = mode_id == "har_trace"
+
+        if is_combined:
+            # Combined: show both HAR view and trace panel
+            self._har_view.setVisible(True)
+            self._trace_panel.setVisible(True)
+        elif has_trace and not has_har:
+            # Trace only: hide HAR, show trace
+            self._har_view.setVisible(False)
+            self._trace_panel.setVisible(True)
+        else:
+            # Record or HAR Record: show HAR, hide trace
+            self._har_view.setVisible(True)
+            self._trace_panel.setVisible(False)
+
+        self._filter_bar_widget.setVisible(has_har)
 
         # Update proxy engine mode if recording
         if self._recording and hasattr(self, '_proxy_engine'):
-            self._proxy_engine.set_mode(AppMode.HAR_RECORD)
+            self._proxy_engine.set_mode(self._app_mode)
 
-        self.statusBar().showMessage("Switched to HAR Record Mode")
+        if has_trace:
+            self._update_rules_display()
 
-    def _switch_to_trace_mode(self):
-        """Switch to API Trace mode."""
-        self._app_mode = AppMode.API_TRACE
-        self.btn_har_mode.setChecked(False)
-        self.btn_trace_mode.setChecked(True)
-        self.btn_trace_mode.setStyleSheet("font-weight:bold; padding: 6px 12px; background-color: #3E4451;")
-        self.btn_har_mode.setStyleSheet("font-weight:bold; padding: 6px 12px;")
-        self._stacked_widget.setCurrentIndex(1)
-        self._filter_bar_widget.setVisible(False)
-
-        # Update proxy engine mode if recording
-        if self._recording and hasattr(self, '_proxy_engine'):
-            self._proxy_engine.set_mode(AppMode.API_TRACE)
-
-        self._update_rules_display()
-        self.statusBar().showMessage("Switched to API Trace Mode - configure intercept rules and toggle intercept ON")
+        mode_names = {
+            "record": "Record Mode (basic capture)",
+            "har_record": "HAR Record Mode",
+            "api_trace": "API Trace Mode (intercept only)",
+            "har_trace": "HAR + Trace Mode (record + intercept)",
+        }
+        self.statusBar().showMessage(f"Mode: {mode_names.get(mode_id, mode_id)}")
 
     # ─── Proxy Control ────────────────────────────────────────────────────────
 

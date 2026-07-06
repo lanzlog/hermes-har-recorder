@@ -23,8 +23,10 @@ from utils import safe_decode, get_content_encoding
 
 class AppMode:
     """Application operation mode."""
-    HAR_RECORD = "har_record"
-    API_TRACE = "api_trace"
+    RECORD = "record"           # Basic recording (no HAR, no intercept)
+    HAR_RECORD = "har_record"   # Record + HAR export
+    API_TRACE = "api_trace"     # Intercept only (no passive recording)
+    HAR_TRACE = "har_trace"     # Both: record HAR + intercept API
 
 
 @dataclass
@@ -101,8 +103,9 @@ class HARCaptureAddon:
         """Called when a request is received."""
         flow._har_start_time = time.time()
 
-        # In trace mode, check if we should intercept this request
-        if self._app_mode == AppMode.API_TRACE and self._trace_engine is not None:
+        # Check if we should intercept (API_TRACE or HAR_TRACE modes)
+        should_intercept = self._app_mode in (AppMode.API_TRACE, AppMode.HAR_TRACE)
+        if should_intercept and self._trace_engine is not None:
             url = flow.request.pretty_url
             method = flow.request.method
 
@@ -139,6 +142,9 @@ class HARCaptureAddon:
 
     def response(self, flow: mflow.Flow):
         """Called when a response is received."""
+        # In API_TRACE-only mode, don't record passively
+        if self._app_mode == AppMode.API_TRACE:
+            return
         try:
             captured = self._convert_flow(flow)
             if captured and self.on_flow_complete:
