@@ -21,6 +21,12 @@ from mitmproxy import flow as mflow
 from utils import safe_decode, get_content_encoding
 
 
+class AppMode:
+    """Application operation mode."""
+    HAR_RECORD = "har_record"
+    API_TRACE = "api_trace"
+
+
 @dataclass
 class CapturedRequest:
     """Represents a captured HTTP request/response pair."""
@@ -62,18 +68,74 @@ class CapturedRequest:
     tls_version: str = ""
     # Replay
     replayed: bool = False
+    # Trace mode
+    trace_status: str = ""  # e.g. "intercepted", "forwarded", "dropped", "modified"
 
 
 class HARCaptureAddon:
-    """mitmproxy addon that captures all HTTP/HTTPS flows."""
+    """mitmproxy addon that captures all HTTP/HTTPS flows.
+    Supports both passive HAR recording and active API trace interception.
+    """
 
-    def __init__(self, on_flow_complete: Optional[Callable] = None):
+    def __init__(self, on_flow_complete: Optional[Callable] = None,
+                 trace_engine=None):
         self.on_flow_complete = on_flow_complete
         self._flow_counter = 0
+        self._trace_engine = trace_engine
+        self._app_mode = AppMode.HAR_RECORD
+        self._on_request_intercepted: Optional[Callable] = None
+
+    def set_mode(self, mode: str):
+        """Switch between HAR_RECORD and API_TRACE mode."""
+        self._app_mode = mode
+
+    def set_trace_engine(self, trace_engine):
+        """Set the trace engine for intercept mode."""
+        self._trace_engine = trace_engine
+
+    def set_on_request_intercepted(self, callback: Optional[Callable]):
+        """Set callback for when a request is intercepted (called from proxy thread)."""
+        self._on_request_intercepted = callback
 
     def request(self, flow: mflow.Flow):
         """Called when a request is received."""
         flow._har_start_time = time.time()
+
+        # In trace mode, check if we should intercept this request
+        if self._app_mode == AppMode.API_TRACE and self._trace_engine is not None:
+            url = flow.request.pretty_url
+            method = flow.request.method
+
+            if self._trace_engine.should_intercept(url, method):
+                try:
+                    # Extract request data
+                    headers = {}
+                    for k, v in flow.request.headers.items():
+                        headers[k] = v
+
+                    body = ""
+                    if flow.request.content:
+                        body = flow.request.content.decode("utf-8", errors="replace")
+
+                    # Intercept the flow (pause it)
+                    flow.intercept()
+
+                    # Register with trace engine
+                    self._trace_engine.intercept_request(
+                        flow_id=str(id(flow)),
+                        method=method,
+                        url=url,
+                        headers=headers,
+                        body=body,
+                        host=flow.request.host,
+                        path=flow.request.path,
+                        scheme=flow.request.scheme,
+                        port=flow.request.port or (443 if flow.request.scheme == 'https' else 80),
+                        flow_obj=flow,
+                    )
+                except Exception as e:
+                    print(f"[HARCaptureAddon] Error intercepting request: {e}")
+                return  # Don't process further; flow is paused
 
     def response(self, flow: mflow.Flow):
         """Called when a response is received."""
@@ -174,7 +236,8 @@ class ProxyEngine:
     """
 
     def __init__(self, port: int = 8899, on_flow: Optional[Callable] = None,
-                 on_error: Optional[Callable] = None, cert_dir: Optional[str] = None):
+                 on_error: Optional[Callable] = None, cert_dir: Optional[str] = None,
+                 trace_engine=None):
         self.port = port
         self._original_port = port
         self.on_flow = on_flow
@@ -183,8 +246,27 @@ class ProxyEngine:
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._running = False
-        self._addon = HARCaptureAddon(on_flow_complete=self._handle_flow)
+        self._addon = HARCaptureAddon(on_flow_complete=self._handle_flow,
+                                       trace_engine=trace_engine)
         self._cert_dir = cert_dir or str(Path.home() / ".hermes-har-recorder" / "certs")
+        self._app_mode = AppMode.HAR_RECORD
+
+    def set_mode(self, mode: str):
+        """Switch the proxy addon between HAR_RECORD and API_TRACE mode."""
+        self._app_mode = mode
+        self._addon.set_mode(mode)
+
+    def get_mode(self) -> str:
+        """Get current mode."""
+        return self._app_mode
+
+    def set_trace_engine(self, trace_engine):
+        """Set or update the trace engine on the addon."""
+        self._addon.set_trace_engine(trace_engine)
+
+    def set_on_request_intercepted(self, callback: Optional[Callable]):
+        """Set callback for intercepted requests."""
+        self._addon.set_on_request_intercepted(callback)
 
     @staticmethod
     def is_port_available(port: int) -> bool:
