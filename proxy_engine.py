@@ -7,12 +7,24 @@ import asyncio
 import os
 import sys
 import time
+import logging
 import threading
 import socket
+import functools
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any, List
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+
+# File logger for proxy engine (survives --windowed mode where print() is lost)
+_log_dir = Path.home() / ".hermes-har-recorder"
+_log_dir.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(
+    filename=str(_log_dir / "hermes.log"),
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("hermes.proxy")
 
 # mitmproxy imports
 from mitmproxy import options as moptions
@@ -95,10 +107,6 @@ class HARCaptureAddon:
         """Set the trace engine for intercept mode."""
         self._trace_engine = trace_engine
 
-    def set_on_request_intercepted(self, callback: Optional[Callable]):
-        """Set callback for when a request is intercepted (called from proxy thread)."""
-        self._on_request_intercepted = callback
-
     def request(self, flow: mflow.Flow):
         """Called when a request is received."""
         flow._har_start_time = time.time()
@@ -137,7 +145,7 @@ class HARCaptureAddon:
                         flow_obj=flow,
                     )
                 except Exception as e:
-                    print(f"[HARCaptureAddon] Error intercepting request: {e}")
+                    logger.error(f"Error intercepting request: {e}")
                 return  # Don't process further; flow is paused
 
     def response(self, flow: mflow.Flow):
@@ -150,7 +158,7 @@ class HARCaptureAddon:
             if captured and self.on_flow_complete:
                 self.on_flow_complete(captured)
         except Exception as e:
-            print(f"[HARCaptureAddon] Error processing flow: {e}")
+            logger.error(f"Error processing flow: {e}")
 
     def _convert_flow(self, flow: mflow.Flow) -> Optional[CapturedRequest]:
         """Convert mitmproxy flow to CapturedRequest."""
@@ -270,14 +278,9 @@ class ProxyEngine:
         """Set or update the trace engine on the addon."""
         self._addon.set_trace_engine(trace_engine)
 
-    def set_on_request_intercepted(self, callback: Optional[Callable]):
-        """Set callback for intercepted requests."""
-        self._addon.set_on_request_intercepted(callback)
-
     @staticmethod
     def is_port_available(port: int) -> bool:
         """Check if a port is available for use."""
-        import socket
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(1)
@@ -309,11 +312,11 @@ class ProxyEngine:
         if not self.is_port_available(self.port):
             new_port = self.find_available_port(self.port)
             if new_port != self.port:
-                print(f"[ProxyEngine] Port {self.port} busy, using {new_port}")
+                logger.info(f"Port {self.port} busy, using {new_port}")
                 self.port = new_port
             else:
                 err = f"Port {self.port} and nearby ports are all in use"
-                print(f"[ProxyEngine] {err}")
+                logger.error(f"{err}")
                 if self.on_error:
                     self.on_error(err)
                 return False
@@ -340,7 +343,7 @@ class ProxyEngine:
         try:
             self._loop.run_until_complete(self._run_proxy_async())
         except Exception as e:
-            print(f"[ProxyEngine] Fatal error: {e}")
+            logger.error(f"Fatal error: {e}")
             if self.on_error:
                 self.on_error(str(e))
         finally:
@@ -364,7 +367,7 @@ class ProxyEngine:
             # This blocks until master is shut down
             await self._master.run()
         except Exception as e:
-            print(f"[ProxyEngine] Async error: {e}")
+            logger.error(f"Async error: {e}")
             if self.on_error:
                 self.on_error(str(e))
         finally:
@@ -381,7 +384,7 @@ class ProxyEngine:
                     self._shutdown_master(), self._loop
                 )
         except Exception as e:
-            print(f"[ProxyEngine] Error stopping: {e}")
+            logger.error(f"Error stopping: {e}")
 
         self._running = False
 
@@ -400,18 +403,28 @@ class ProxyEngine:
     def is_running(self) -> bool:
         return self._running
 
+    def get_loop(self) -> Optional[asyncio.AbstractEventLoop]:
+        """Get the asyncio event loop running mitmproxy (for thread-safe flow ops)."""
+        return self._loop
+
     def get_cert_path(self) -> str:
         """Get path to the mitmproxy CA certificate."""
         cert_path = Path(self._cert_dir) / "mitmproxy-ca-cert.pem"
         return str(cert_path)
 
+    @functools.lru_cache(maxsize=256)
+    @staticmethod
+    def _cached_gethostbyname(hostname: str) -> str:
+        """Cached DNS lookup to avoid blocking on repeated calls."""
+        try:
+            return socket.gethostbyname(hostname)
+        except Exception:
+            return "127.0.0.1"
+
     def get_listen_info(self) -> str:
         """Get proxy listen address info."""
         hostname = socket.gethostname()
-        try:
-            local_ip = socket.gethostbyname(hostname)
-        except Exception:
-            local_ip = "127.0.0.1"
+        local_ip = self._cached_gethostbyname(hostname)
         return f"http://{local_ip}:{self.port}"
 
 
@@ -430,7 +443,7 @@ def set_system_proxy(port: int) -> bool:
             winreg.CloseKey(internet_settings)
             return True
     except Exception as e:
-        print(f"[set_system_proxy] Error: {e}")
+        logger.error(f"set_system_proxy error: {e}")
     return False
 
 
@@ -448,5 +461,5 @@ def unset_system_proxy() -> bool:
             winreg.CloseKey(internet_settings)
             return True
     except Exception as e:
-        print(f"[unset_system_proxy] Error: {e}")
+        logger.error(f"unset_system_proxy error: {e}")
     return False

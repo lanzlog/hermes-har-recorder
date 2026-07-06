@@ -8,6 +8,7 @@ import sys
 import json
 import time
 import copy
+import atexit
 from pathlib import Path
 from typing import List, Optional, Dict, Set
 from datetime import datetime
@@ -30,7 +31,7 @@ from PyQt6.QtGui import (
     QAction, QKeySequence, QIcon, QClipboard, QBrush,
 )
 
-from proxy_engine import CapturedRequest, AppMode
+from proxy_engine import CapturedRequest, AppMode, unset_system_proxy
 from utils import (
     format_size, format_duration, get_mime_category, is_static_resource,
     generate_session_name, get_status_class, detect_oauth_flow,
@@ -524,6 +525,7 @@ class HARRecorderWindow(QMainWindow):
         # Trace engine
         self._trace_engine = TraceEngine()
         self._trace_engine.on_request_intercepted = self._emit_intercepted
+        self._trace_engine.on_request_completed = lambda req: self.request_trace_completed.emit(req)
 
         # Replay engine
         self._replay_engine = ReplayEngine(
@@ -534,6 +536,10 @@ class HARRecorderWindow(QMainWindow):
         self._connect_signals()
         self._apply_dark_theme()
         self._restore_session()
+
+        # Honor always_on_top from config
+        if self.config.get("always_on_top", False):
+            self._toggle_on_top(True)
 
         # Auto-save timer
         self._auto_save_timer = QTimer()
@@ -790,6 +796,7 @@ class HARRecorderWindow(QMainWindow):
         act_export = QAction("Export...", self)
         act_export.setShortcut(QKeySequence("Ctrl+E"))
         act_export.triggered.connect(self._on_export)
+        self._act_export = act_export
         file_menu.addAction(act_export)
 
         file_menu.addSeparator()
@@ -870,6 +877,11 @@ class HARRecorderWindow(QMainWindow):
         act_about.triggered.connect(self._show_about)
         help_menu.addAction(act_about)
 
+        help_menu.addSeparator()
+        act_cert = QAction("Install HTTPS Certificate...", self)
+        act_cert.triggered.connect(self._show_cert_install)
+        help_menu.addAction(act_cert)
+
     def _connect_signals(self):
         """Connect signals and slots."""
         self.btn_record.clicked.connect(self._on_record)
@@ -880,6 +892,13 @@ class HARRecorderWindow(QMainWindow):
         # Mode toggle
         for mode_id, btn in self._mode_buttons.items():
             btn.clicked.connect(lambda checked, m=mode_id: self._switch_mode(m))
+
+        # Delete key shortcut (window-level so it works without context menu open)
+        self._act_delete = QAction("Remove Selected", self)
+        self._act_delete.setShortcut(QKeySequence("Delete"))
+        self._act_delete.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self._act_delete.triggered.connect(self._remove_selected)
+        self.addAction(self._act_delete)
 
         self.flow_received.connect(self._on_flow_received)
         self.proxy_error.connect(self._on_proxy_error)
@@ -1163,7 +1182,28 @@ class HARRecorderWindow(QMainWindow):
 
     def _toggle_intercept(self, state):
         """Toggle intercept on/off."""
-        enabled = state == 2  # Qt.CheckState.Checked
+        enabled = self.chk_intercept.isChecked()
+
+        # If turning OFF with pending requests, prompt user
+        if not enabled and hasattr(self, '_trace_engine'):
+            pending = self._trace_engine.get_pending_count() if hasattr(self._trace_engine, 'get_pending_count') else len(self._trace_engine._queue)
+            if pending > 0:
+                reply = QMessageBox.question(
+                    self, "Pending Requests",
+                    f"{pending} request(s) still intercepted and waiting.\nWhat do you want to do?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+                )
+                # Yes = Forward All, No = Drop All, Cancel = keep intercept on
+                if reply == QMessageBox.StandardButton.Cancel:
+                    self.chk_intercept.blockSignals(True)
+                    self.chk_intercept.setChecked(True)
+                    self.chk_intercept.blockSignals(False)
+                    return
+                elif reply == QMessageBox.StandardButton.Yes:
+                    self._trace_engine.forward_all()
+                else:
+                    self._trace_engine.drop_all()
+
         self._trace_engine.intercept_enabled = enabled
         if enabled:
             self.chk_intercept.setText("🔴 Intercept: ON")
@@ -1484,6 +1524,12 @@ class HARRecorderWindow(QMainWindow):
 
         self._filter_bar_widget.setVisible(has_har)
 
+        # Disable export in basic Record mode (no HAR formatting)
+        can_export = mode_id != "record"
+        self.btn_export.setEnabled(can_export)
+        if hasattr(self, '_act_export'):
+            self._act_export.setEnabled(can_export)
+
         # Update proxy engine mode if recording
         if self._recording and hasattr(self, '_proxy_engine'):
             self._proxy_engine.set_mode(self._app_mode)
@@ -1523,6 +1569,9 @@ class HARRecorderWindow(QMainWindow):
         if self._proxy_engine.start():
             self._recording = True
             actual_port = self._proxy_engine.port
+            # Wire event loop into trace engine for thread-safe flow ops
+            if hasattr(self, '_trace_engine') and self._trace_engine:
+                self._trace_engine.set_loop(self._proxy_engine.get_loop())
             self.btn_record.setEnabled(False)
             self.btn_stop.setEnabled(True)
             self.lbl_proxy.setText(f"🟢 Proxy: :{actual_port}")
@@ -1535,6 +1584,7 @@ class HARRecorderWindow(QMainWindow):
             # Auto-set system proxy on Windows
             if self.config.get("auto_set_proxy", True):
                 set_system_proxy(actual_port)
+                atexit.register(unset_system_proxy)
         else:
             QMessageBox.warning(self, "Error", 
                 f"Failed to start proxy on port {port}.\n"
@@ -1819,20 +1869,33 @@ class HARRecorderWindow(QMainWindow):
 
     def _apply_highlighter(self, text_widget: QPlainTextEdit, content_type: str):
         """Apply syntax highlighting based on content type."""
-        # Remove existing highlighter
-        old = text_widget.document().parent()
-        if isinstance(old, QSyntaxHighlighter):
-            old.setDocument(None)
+        # Track highlighters per widget to prevent memory leak
+        if not hasattr(self, '_active_highlighters'):
+            self._active_highlighters = {}
+
+        key = id(text_widget)
+        old = self._active_highlighters.get(key)
+        if old is not None:
+            try:
+                old.setDocument(None)
+                old.deleteLater()
+            except Exception:
+                pass
+            self._active_highlighters.pop(key, None)
 
         ct = content_type.lower()
+        new_hl = None
         if 'json' in ct:
-            JSONHighlighter(text_widget.document())
+            new_hl = JSONHighlighter(text_widget.document())
         elif 'html' in ct:
-            HTMLHighlighter(text_widget.document())
+            new_hl = HTMLHighlighter(text_widget.document())
         elif 'css' in ct:
-            CSSHighlighter(text_widget.document())
+            new_hl = CSSHighlighter(text_widget.document())
         elif 'javascript' in ct:
-            JSHighlighter(text_widget.document())
+            new_hl = JSHighlighter(text_widget.document())
+
+        if new_hl is not None:
+            self._active_highlighters[key] = new_hl
 
     def _clear_detail(self):
         """Clear detail panels."""
@@ -1954,7 +2017,7 @@ class HARRecorderWindow(QMainWindow):
         dlg = EditRequestDialogUI(flow, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             data = dlg.get_modified_data()
-            self.statusBar().showMessage(f"Replaying edited request...")
+            self.statusBar().showMessage("Replaying edited request...")
             self._replay_engine.replay_async(
                 flow,
                 modified_url=data["url"],
@@ -2131,7 +2194,7 @@ class HARRecorderWindow(QMainWindow):
             session_data["flows"].append(fd)
 
         try:
-            with open(filepath, 'w') as f:
+            with open(filepath, 'w', encoding='utf-8') as f:
                 json.dump(session_data, f)
             self.statusBar().showMessage(f"Session saved: {filepath.name}", 3000)
             self.config["last_session"] = str(filepath)
@@ -2151,7 +2214,7 @@ class HARRecorderWindow(QMainWindow):
     def _load_session_file(self, path: str):
         """Load session from a specific file."""
         try:
-            with open(path, 'r') as f:
+            with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
             self._flows.clear()
@@ -2161,6 +2224,18 @@ class HARRecorderWindow(QMainWindow):
                     if hasattr(flow, k):
                         setattr(flow, k, v)
                 self._flows.append(flow)
+
+            # Rebuild domain filter dropdown from loaded flows
+            self._domains.clear()
+            self.filter_domain.blockSignals(True)
+            self.filter_domain.clear()
+            self.filter_domain.addItem("ALL")
+            for f in self._flows:
+                host = getattr(f, 'host', '') or ''
+                if host and host not in self._domains:
+                    self._domains.add(host)
+                    self.filter_domain.addItem(host)
+            self.filter_domain.blockSignals(False)
 
             self._step_markers = data.get("step_markers", [])
             self._apply_filters()
@@ -2211,7 +2286,7 @@ class HARRecorderWindow(QMainWindow):
                 }
                 session_data["flows"].append(fd)
             try:
-                with open(filepath, 'w') as f:
+                with open(filepath, 'w', encoding='utf-8') as f:
                     json.dump(session_data, f)
             except Exception:
                 pass
@@ -2260,6 +2335,52 @@ class HARRecorderWindow(QMainWindow):
             f"Pause, inspect, modify, forward, or drop requests in real-time.</p>"
             f"<hr><p>Built with Python, PyQt6, and mitmproxy.</p>"
         )
+
+    def _show_cert_install(self):
+        """Show HTTPS certificate installation dialog."""
+        import subprocess
+        import platform
+
+        cert_dir = Path.home() / ".hermes-har-recorder" / "certs"
+        cert_path = cert_dir / "mitmproxy-ca-cert.pem"
+
+        # Try to get path from running proxy engine
+        if hasattr(self, '_proxy_engine'):
+            cert_path = Path(self._proxy_engine.get_cert_path())
+            cert_dir = cert_path.parent
+
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Install HTTPS Certificate")
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setText("<b>To intercept HTTPS traffic, install the mitmproxy CA certificate.</b>")
+        msg.setDetailedText(
+            f"Certificate path:\n{cert_path}\n\n"
+            "Windows installation steps:\n"
+            "1. Click 'Open Certificate Folder'\n"
+            "2. Double-click mitmproxy-ca-cert.pem\n"
+            "3. Click 'Install Certificate'\n"
+            "4. Select 'Local Machine' → Next\n"
+            "5. Select 'Place all certificates in the following store'\n"
+            "6. Browse → 'Trusted Root Certification Authorities'\n"
+            "7. Click OK → Next → Finish\n"
+            "8. Restart your browser\n\n"
+            "Note: The cert is generated on first proxy start.\n"
+            "Start recording once before installing."
+        )
+        btn_open = msg.addButton("Open Cert Folder", QMessageBox.ButtonRole.ActionRole)
+        btn_copy = msg.addButton("Copy Path", QMessageBox.ButtonRole.ActionRole)
+        msg.addButton(QMessageBox.StandardButton.Close)
+        msg.exec()
+
+        clicked = msg.clickedButton()
+        if clicked == btn_open:
+            cert_dir.mkdir(parents=True, exist_ok=True)
+            if platform.system() == "Windows":
+                os.startfile(str(cert_dir))
+            else:
+                subprocess.Popen(["xdg-open", str(cert_dir)])
+        elif clicked == btn_copy:
+            QApplication.clipboard().setText(str(cert_path))
 
     def _on_proxy_error(self, error: str):
         """Handle proxy errors."""

@@ -60,7 +60,7 @@ def replay_request(flow: CapturedRequest,
             headers=clean_headers,
             data=body if body else None,
             timeout=timeout,
-            verify=False,
+            verify=self._get_verify(),
             allow_redirects=True,
         )
         result.duration = time.time() - start
@@ -93,6 +93,12 @@ class ReplayEngine:
                  on_error: Optional[Callable] = None):
         self.on_complete = on_complete
         self.on_error = on_error
+
+    def _get_verify(self):
+        """Return cert path for TLS verification, or False as fallback."""
+        from pathlib import Path
+        cert = Path.home() / ".hermes-har-recorder" / "certs" / "mitmproxy-ca-cert.pem"
+        return str(cert) if cert.exists() else False
 
     def replay_async(self, flow: CapturedRequest,
                       modified_url: Optional[str] = None,

@@ -5,23 +5,54 @@ HAR spec: http://www.softwareishard.com/blog/har-12-spec/
 
 import json
 import datetime
+from http.cookies import SimpleCookie
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse, parse_qs
 
 from proxy_engine import CapturedRequest
-from utils import APP_NAME, APP_VERSION, safe_decode
+from utils import APP_NAME, APP_VERSION
 
 
-def _format_cookies(cookies: Dict[str, str]) -> List[Dict[str, Any]]:
-    """Format cookies dict to HAR cookies array."""
+def _format_cookies(cookies: Dict[str, str],
+                    set_cookie_header: str = "") -> List[Dict[str, Any]]:
+    """Format cookies dict to HAR cookies array.
+
+    If set_cookie_header is provided (response cookies), parse
+    httpOnly/secure/path/domain/expires attributes from it.
+    """
+    # Build attribute lookup from Set-Cookie header
+    attr_map: Dict[str, Dict[str, Any]] = {}
+    if set_cookie_header:
+        try:
+            sc = SimpleCookie()
+            sc.load(set_cookie_header)
+            for name, morsel in sc.items():
+                attr_map[name] = {
+                    "httpOnly": bool(morsel["httponly"]) if morsel["httponly"] else False,
+                    "secure": bool(morsel["secure"]) if morsel["secure"] else False,
+                    "path": morsel["path"] or "",
+                    "domain": morsel["domain"] or "",
+                    "expires": morsel["expires"] or "",
+                }
+        except Exception:
+            attr_map = {}
+
     result = []
     for name, value in cookies.items():
-        result.append({
+        attrs = attr_map.get(name, {})
+        entry: Dict[str, Any] = {
             "name": name,
             "value": value,
-            "httpOnly": False,
-            "secure": False,
-        })
+            "httpOnly": attrs.get("httpOnly", False),
+            "secure": attrs.get("secure", False),
+        }
+        if attrs.get("path"):
+            entry["path"] = attrs["path"]
+        if attrs.get("domain"):
+            entry["domain"] = attrs["domain"]
+        if attrs.get("expires"):
+            entry["expires"] = attrs["expires"]
+        result.append(entry)
     return result
 
 
@@ -80,30 +111,36 @@ def _format_timings(captured: CapturedRequest) -> Dict[str, Any]:
 
 def flow_to_har_entry(captured: CapturedRequest) -> Dict[str, Any]:
     """Convert a CapturedRequest to a HAR entry."""
-    # Parse URL for path
-    parsed = urlparse(captured.url)
     full_url = captured.url
 
     # Request
-    request = {
+    request: Dict[str, Any] = {
         "method": captured.method,
         "url": full_url,
         "httpVersion": captured.http_version,
         "cookies": _format_cookies(captured.request_cookies),
         "headers": _format_headers(captured.request_headers),
         "queryString": _format_query_string(full_url),
-        "postData": _get_content(captured.request_body, captured.request_headers,
-                                  captured.request_body_text),
         "headersSize": -1,
         "bodySize": captured.request_size,
     }
 
+    # postData: only include when there is a body AND for methods that carry a body
+    if captured.request_body and captured.method.upper() in ("POST", "PUT", "PATCH", "DELETE"):
+        request["postData"] = _get_content(
+            captured.request_body, captured.request_headers,
+            captured.request_body_text,
+        )
+
     # Response
+    set_cookie_header = captured.response_headers.get(
+        "Set-Cookie", captured.response_headers.get("set-cookie", "")
+    )
     response = {
         "status": captured.status_code,
         "statusText": captured.reason,
         "httpVersion": captured.http_version,
-        "cookies": _format_cookies(captured.response_cookies),
+        "cookies": _format_cookies(captured.response_cookies, set_cookie_header),
         "headers": _format_headers(captured.response_headers),
         "content": _get_content(captured.response_body, captured.response_headers,
                                  captured.response_body_text),
@@ -138,14 +175,9 @@ def flows_to_har(flows: List[CapturedRequest],
     """Convert a list of CapturedRequests to a complete HAR 1.2 document."""
     if not flows:
         earliest = datetime.datetime.now(tz=datetime.timezone.utc)
-        latest = earliest
     else:
         earliest = datetime.datetime.fromtimestamp(
             min(f.request_time for f in flows), tz=datetime.timezone.utc
-        )
-        latest = datetime.datetime.fromtimestamp(
-            max(f.response_time or f.request_time for f in flows),
-            tz=datetime.timezone.utc
         )
 
     har = {
