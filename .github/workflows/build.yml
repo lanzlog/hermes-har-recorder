@@ -22,11 +22,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
+          echo "Dependencies installed"
           
-      - name: Build Application
-        run: python build.py
+      - name: Run Build
+        run: |
+          python build.py
+          dir dist
+          echo "Build finished, checking dist folder..."
           
-      - name: Upload Build (All dist)
+      - name: Upload Build
         uses: actions/upload-artifact@v4
         with:
           name: HermesHARRecorder-Build
