@@ -21,6 +21,14 @@ from mitmproxy import flow as mflow
 from utils import safe_decode, get_content_encoding
 
 
+class AppMode:
+    """Application operation mode."""
+    RECORD = "record"           # Basic recording (no HAR, no intercept)
+    HAR_RECORD = "har_record"   # Record + HAR export
+    API_TRACE = "api_trace"     # Intercept only (no passive recording)
+    HAR_TRACE = "har_trace"     # Both: record HAR + intercept API
+
+
 @dataclass
 class CapturedRequest:
     """Represents a captured HTTP request/response pair."""
@@ -62,21 +70,81 @@ class CapturedRequest:
     tls_version: str = ""
     # Replay
     replayed: bool = False
+    # Trace mode
+    trace_status: str = ""  # e.g. "intercepted", "forwarded", "dropped", "modified"
 
 
 class HARCaptureAddon:
-    """mitmproxy addon that captures all HTTP/HTTPS flows."""
+    """mitmproxy addon that captures all HTTP/HTTPS flows.
+    Supports both passive HAR recording and active API trace interception.
+    """
 
-    def __init__(self, on_flow_complete: Optional[Callable] = None):
+    def __init__(self, on_flow_complete: Optional[Callable] = None,
+                 trace_engine=None):
         self.on_flow_complete = on_flow_complete
         self._flow_counter = 0
+        self._trace_engine = trace_engine
+        self._app_mode = AppMode.HAR_RECORD
+        self._on_request_intercepted: Optional[Callable] = None
+
+    def set_mode(self, mode: str):
+        """Switch between HAR_RECORD and API_TRACE mode."""
+        self._app_mode = mode
+
+    def set_trace_engine(self, trace_engine):
+        """Set the trace engine for intercept mode."""
+        self._trace_engine = trace_engine
+
+    def set_on_request_intercepted(self, callback: Optional[Callable]):
+        """Set callback for when a request is intercepted (called from proxy thread)."""
+        self._on_request_intercepted = callback
 
     def request(self, flow: mflow.Flow):
         """Called when a request is received."""
         flow._har_start_time = time.time()
 
+        # Check if we should intercept (API_TRACE or HAR_TRACE modes)
+        should_intercept = self._app_mode in (AppMode.API_TRACE, AppMode.HAR_TRACE)
+        if should_intercept and self._trace_engine is not None:
+            url = flow.request.pretty_url
+            method = flow.request.method
+
+            if self._trace_engine.should_intercept(url, method):
+                try:
+                    # Extract request data
+                    headers = {}
+                    for k, v in flow.request.headers.items():
+                        headers[k] = v
+
+                    body = ""
+                    if flow.request.content:
+                        body = flow.request.content.decode("utf-8", errors="replace")
+
+                    # Intercept the flow (pause it)
+                    flow.intercept()
+
+                    # Register with trace engine
+                    self._trace_engine.intercept_request(
+                        flow_id=str(id(flow)),
+                        method=method,
+                        url=url,
+                        headers=headers,
+                        body=body,
+                        host=flow.request.host,
+                        path=flow.request.path,
+                        scheme=flow.request.scheme,
+                        port=flow.request.port or (443 if flow.request.scheme == 'https' else 80),
+                        flow_obj=flow,
+                    )
+                except Exception as e:
+                    print(f"[HARCaptureAddon] Error intercepting request: {e}")
+                return  # Don't process further; flow is paused
+
     def response(self, flow: mflow.Flow):
         """Called when a response is received."""
+        # In API_TRACE-only mode, don't record passively
+        if self._app_mode == AppMode.API_TRACE:
+            return
         try:
             captured = self._convert_flow(flow)
             if captured and self.on_flow_complete:
@@ -174,16 +242,64 @@ class ProxyEngine:
     """
 
     def __init__(self, port: int = 8899, on_flow: Optional[Callable] = None,
-                 on_error: Optional[Callable] = None, cert_dir: Optional[str] = None):
+                 on_error: Optional[Callable] = None, cert_dir: Optional[str] = None,
+                 trace_engine=None):
         self.port = port
+        self._original_port = port
         self.on_flow = on_flow
         self.on_error = on_error
         self._master: Optional[DumpMaster] = None
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._running = False
-        self._addon = HARCaptureAddon(on_flow_complete=self._handle_flow)
+        self._addon = HARCaptureAddon(on_flow_complete=self._handle_flow,
+                                       trace_engine=trace_engine)
         self._cert_dir = cert_dir or str(Path.home() / ".hermes-har-recorder" / "certs")
+        self._app_mode = AppMode.HAR_RECORD
+
+    def set_mode(self, mode: str):
+        """Switch the proxy addon between HAR_RECORD and API_TRACE mode."""
+        self._app_mode = mode
+        self._addon.set_mode(mode)
+
+    def get_mode(self) -> str:
+        """Get current mode."""
+        return self._app_mode
+
+    def set_trace_engine(self, trace_engine):
+        """Set or update the trace engine on the addon."""
+        self._addon.set_trace_engine(trace_engine)
+
+    def set_on_request_intercepted(self, callback: Optional[Callable]):
+        """Set callback for intercepted requests."""
+        self._addon.set_on_request_intercepted(callback)
+
+    @staticmethod
+    def is_port_available(port: int) -> bool:
+        """Check if a port is available for use."""
+        import socket
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(1)
+                s.bind(('127.0.0.1', port))
+                return True
+        except OSError:
+            return False
+
+    def find_available_port(self, start_port: int = 8899, max_tries: int = 50) -> int:
+        """Find an available port starting from start_port.
+        Falls back to OS-assigned port if no port found in range."""
+        for i in range(max_tries):
+            port = start_port + i
+            if self.is_port_available(port):
+                return port
+        # Fallback: let OS assign a free port
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('127.0.0.1', 0))
+                return s.getsockname()[1]
+        except OSError:
+            return start_port
 
     def _handle_flow(self, captured: CapturedRequest):
         """Forward captured flow to the callback (called from proxy thread)."""
@@ -191,44 +307,50 @@ class ProxyEngine:
             # Use a thread-safe call - Qt signals handle this in gui_main
             self.on_flow(captured)
 
-    def _is_port_free(self, port: int) -> bool:
-        """Check if a port is available to bind."""
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(('127.0.0.1', port))
-                return True
-        except OSError:
-            return False
-
-    def start(self, port_range: int = 10) -> bool:
-        """Start the proxy in a background thread. Auto-retries ports if busy."""
+    def start(self) -> bool:
+        """Start the proxy in a background thread."""
         if self._running:
             return True
 
-        # Find a free port starting from self.port
-        base_port = self.port
-        for p in range(base_port, base_port + port_range):
-            if self._is_port_free(p):
-                self.port = p
-                break
-        else:
-            print(f"[ProxyEngine] No free port found in range {base_port}-{base_port + port_range - 1}")
-            return False
+        # Try up to 3 different ports
+        original_port = self.port
+        for attempt in range(3):
+            # Auto-find available port if default is busy
+            if not self.is_port_available(self.port):
+                new_port = self.find_available_port(self.port)
+                if new_port != self.port:
+                    print(f"[ProxyEngine] Port {self.port} busy, using {new_port}")
+                    self.port = new_port
+                else:
+                    err = f"Port {self.port} and nearby ports are all in use"
+                    print(f"[ProxyEngine] {err}")
+                    if self.on_error:
+                        self.on_error(err)
+                    return False
 
-        # Ensure cert directory exists
-        Path(self._cert_dir).mkdir(parents=True, exist_ok=True)
+            # Ensure cert directory exists
+            Path(self._cert_dir).mkdir(parents=True, exist_ok=True)
 
-        self._thread = threading.Thread(target=self._run_proxy, daemon=True)
-        self._thread.start()
+            self._thread = threading.Thread(target=self._run_proxy, daemon=True)
+            self._thread.start()
 
-        # Wait for proxy to be ready
-        for _ in range(50):  # 5 seconds max
-            if self._running:
-                return True
-            time.sleep(0.1)
+            # Wait for proxy to be ready
+            for _ in range(50):  # 5 seconds max
+                if self._running:
+                    return True
+                time.sleep(0.1)
 
-        return self._running
+            # Proxy failed to start — try next port
+            print(f"[ProxyEngine] Failed on port {self.port}, attempt {attempt+1}/3")
+            self._running = False
+            if self._thread and self._thread.is_alive():
+                self._thread.join(timeout=2)
+            self.port = original_port + (attempt + 1) * 10
+
+        if self.on_error:
+            self.on_error(f"Failed to start proxy after 3 attempts")
+        self.port = original_port
+        return False
 
     def _run_proxy(self):
         """Run the mitmproxy event loop in a background thread."""

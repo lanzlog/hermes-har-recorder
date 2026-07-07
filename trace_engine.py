@@ -6,6 +6,7 @@ Works with mitmproxy's intercept/resume/kill mechanism.
 
 import re
 import time
+import uuid
 import threading
 from dataclasses import dataclass, field
 from typing import Optional, Callable, Dict, List, Any
@@ -82,35 +83,6 @@ class TraceEngine:
         self._flow_map: Dict[str, Any] = {}  # flow_id -> mitmproxy flow object
         self._lock = threading.Lock()
         self._counter = 0
-        # asyncio event loop where mitmproxy flows live (set by ProxyEngine)
-        self._loop = None
-
-    def set_loop(self, loop):
-        """Set the asyncio event loop where mitmproxy runs.
-
-        flow.resume()/flow.kill() must be dispatched onto this loop
-        to be thread-safe.
-        """
-        self._loop = loop
-
-    def _call_on_loop(self, fn: Callable, *args):
-        """Schedule fn(*args) on the mitmproxy loop from the Qt thread.
-
-        Falls back to direct call (with a warning) if the loop is not
-        available — should not happen in normal operation.
-        """
-        loop = self._loop
-        if loop is not None:
-            try:
-                loop.call_soon_threadsafe(fn, *args)
-                return
-            except Exception as e:
-                print(f"[TraceEngine] Failed to schedule on loop: {e}; "
-                      f"falling back to direct call")
-        try:
-            fn(*args)
-        except Exception as e:
-            print(f"[TraceEngine] Fallback direct call failed: {e}")
 
     def add_rule(self, pattern: str, match_type: str = "contains",
                  method_filter: str = "ALL") -> InterceptRule:
@@ -271,10 +243,10 @@ class TraceEngine:
             self.pending_requests.remove(req)
             self.completed_requests.append(req)
 
-            # Resume the mitmproxy flow (thread-safe: dispatch onto proxy loop)
+            # Resume the mitmproxy flow
             if flow is not None:
                 try:
-                    self._call_on_loop(flow.resume)
+                    flow.resume()
                 except Exception as e:
                     print(f"[TraceEngine] Error resuming flow: {e}")
                 finally:

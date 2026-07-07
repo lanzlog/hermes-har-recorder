@@ -6,8 +6,9 @@ HAR, CSV, JSON, cURL, Python requests, fetch() snippets.
 import csv
 import json
 import io
-import shlex
-from typing import List, Dict
+import re
+from typing import List, Optional, Dict
+from urllib.parse import urlparse
 
 from proxy_engine import CapturedRequest
 from har_formatter import flows_to_har, save_har
@@ -17,19 +18,21 @@ def to_curl(flow: CapturedRequest) -> str:
     """Convert a captured request to cURL command."""
     parts = ["curl", "-X", flow.method]
 
-    # URL (properly shell-quoted)
-    parts.append(shlex.quote(flow.url))
+    # URL (quote it)
+    url = flow.url
+    parts.append(f"'{url}'")
 
     # Headers
     skip_headers = {'host', 'content-length', 'transfer-encoding'}
     for key, value in flow.request_headers.items():
         if key.lower() not in skip_headers:
-            header_line = f"{key}: {value}"
-            parts.extend(["-H", shlex.quote(header_line)])
+            escaped_value = value.replace("'", "\\'")
+            parts.extend(["-H", f"'{key}: {escaped_value}'"])
 
     # Body
     if flow.request_body_text and flow.method in ('POST', 'PUT', 'PATCH'):
-        parts.extend(["-d", shlex.quote(flow.request_body_text)])
+        body = flow.request_body_text.replace("'", "\\'")
+        parts.extend(["-d", f"'{body}'"])
 
     # Insecure for HTTPS
     if flow.scheme == 'https':
@@ -43,7 +46,7 @@ def to_python_requests(flow: CapturedRequest) -> str:
     lines = ["import requests", ""]
 
     # URL
-    lines.append(f"url = {repr(flow.url)}")
+    lines.append(f'url = "{flow.url}"')
 
     # Headers
     if flow.request_headers:
@@ -51,27 +54,27 @@ def to_python_requests(flow: CapturedRequest) -> str:
         lines.append("headers = {")
         for key, value in flow.request_headers.items():
             if key.lower() not in skip_headers:
-                lines.append(f"    {repr(key)}: {repr(value)},")
+                escaped = value.replace('"', '\\"')
+                lines.append(f'    "{key}": "{escaped}",')
         lines.append("}")
 
     # Body
     body_param = ""
     if flow.request_body_text and flow.method in ('POST', 'PUT', 'PATCH'):
-        # Try to parse as JSON regardless of Content-Type header
-        parsed_json = None
+        # Try JSON
         try:
-            parsed_json = json.loads(flow.request_body_text)
-        except (json.JSONDecodeError, ValueError, TypeError):
-            parsed_json = None
-
-        if parsed_json is not None:
-            # Valid JSON body -> use json= param with parsed dict/list literal
-            lines.append(f"json_data = {repr(parsed_json)}")
-            body_param = ", json=json_data"
-        else:
-            # Not valid JSON -> raw data (properly escaped via repr())
+            json.loads(flow.request_body_text)
             lines.append(f"data = {repr(flow.request_body_text)}")
             body_param = ", data=data"
+        except (json.JSONDecodeError, ValueError):
+            # Check content type
+            ct = flow.request_headers.get('Content-Type', '')
+            if 'json' in ct.lower():
+                lines.append(f"json_data = {flow.request_body_text}")
+                body_param = ", json=json_data"
+            else:
+                lines.append(f"data = {repr(flow.request_body_text)}")
+                body_param = ", data=data"
 
     # Request
     method = flow.method.lower()
@@ -105,7 +108,7 @@ def to_fetch(flow: CapturedRequest) -> str:
 
     options_json = json.dumps(options, indent=2)
 
-    return f"""fetch({json.dumps(flow.url)}, {options_json})
+    return f"""fetch("{flow.url}", {options_json})
   .then(response => response.json())
   .then(data => console.log(data))
   .catch(error => console.error('Error:', error));"""

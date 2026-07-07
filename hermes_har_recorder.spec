@@ -7,21 +7,52 @@ Build with: pyinstaller hermes_har_recorder.spec
 import sys
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
-
 block_cipher = None
-
-datas = collect_data_files('mitmproxy')
-hiddenimports = collect_submodules('mitmproxy') + [
-    'PyQt6', 'PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets',
-]
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=datas,
-    hiddenimports=hiddenimports,
+    datas=[],
+    hiddenimports=[
+        'mitmproxy.tools.dump',
+        'mitmproxy.net.http',
+        'mitmproxy.addons',
+        'mitmproxy.proxy',
+        'mitmproxy.flow',
+        'mitmproxy.options',
+        'mitmproxy.certs',
+        'mitmproxy.connection',
+        'mitmproxy.contentviews',
+        'mitmproxy.contentviews.json',
+        'mitmproxy.contentviews.xml_html',
+        'mitmproxy.contentviews.css',
+        'mitmproxy.contentviews.javascript',
+        'mitmproxy.contentviews.image',
+        'mitmproxy.contentviews.mqtt',
+        'mitmproxy.contentviews.grpc',
+        'mitmproxy.contentviews.wbxml',
+        'mitmproxy.net.dns',
+        'mitmproxy.net.server_spec',
+        'mitmproxy.net.tls',
+        'mitmproxy.proxy.layers',
+        'mitmproxy.proxy.layers.dns',
+        'mitmproxy.proxy.layers.http',
+        'mitmproxy.proxy.layers.tls',
+        'mitmproxy.proxy.layers.websocket',
+        'mitmproxy.proxy.server',
+        'mitmproxy.proxy.server_hooks',
+        'mitmproxy.proxy.mode_servers',
+        'mitmproxy.scripts',
+        'mitmproxy.utils',
+        'cryptography',
+        'OpenSSL',
+        'PyQt6.QtWidgets',
+        'PyQt6.QtCore',
+        'PyQt6.QtGui',
+        'PyQt6.sip',
+        'sqlite3',
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

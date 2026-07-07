@@ -60,7 +60,7 @@ def load_config() -> Dict[str, Any]:
     }
     if CONFIG_FILE.exists():
         try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            with open(CONFIG_FILE, 'r') as f:
                 saved = json.load(f)
             defaults.update(saved)
         except Exception:
@@ -72,7 +72,7 @@ def save_config(config: Dict[str, Any]):
     """Save application configuration."""
     try:
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        with open(CONFIG_FILE, 'w') as f:
             json.dump(config, f, indent=2)
     except Exception as e:
         print(f"Warning: Could not save config: {e}")
