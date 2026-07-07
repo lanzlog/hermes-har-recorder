@@ -10,9 +10,9 @@ os.chdir(Path(__file__).parent)
 
 # Build arguments
 build_args = [
-    "pyinstaller",
+    sys.executable, "-m", "PyInstaller",
     "--name=HermesHARRecorder",
-    "--one-dir",                    # Lebih stabil untuk mitmproxy + PyQt6
+    "--onedir",                     # Lebih stabil untuk mitmproxy + PyQt6
     "--windowed",
     "--clean",
     "--noconfirm",
