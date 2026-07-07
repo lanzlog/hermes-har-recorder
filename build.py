@@ -1,28 +1,27 @@
 import os
-import sys
 from pathlib import Path
-
-# =============================================
-# Hermes HAR Recorder - Build Configuration
-# =============================================
 
 os.chdir(Path(__file__).parent)
 
-# Build arguments
-build_args = [
-    sys.executable, "-m", "PyInstaller",
+# =============================================
+# Hermes HAR Recorder - ULTIMATE BUILD
+# =============================================
+
+build_cmd = [
+    "pyinstaller",
     "--name=HermesHARRecorder",
-    "--onedir",                     # Lebih stabil untuk mitmproxy + PyQt6
+    "--one-dir",
     "--windowed",
     "--clean",
     "--noconfirm",
     "--noupx",
     
-    # Data files
+    # Data & Resources
     "--add-data=README.md;.",
     "--add-data=requirements.txt;.",
     
-    # Hidden imports (ini yang biasanya bikin error)
+    # Hidden Imports (lengkap banget)
+    "--hidden-import=PyQt6",
     "--hidden-import=PyQt6.QtCore",
     "--hidden-import=PyQt6.QtGui",
     "--hidden-import=PyQt6.QtWidgets",
@@ -32,36 +31,38 @@ build_args = [
     "--hidden-import=mitmproxy.proxy",
     "--hidden-import=mitmproxy.addons",
     "--hidden-import=mitmproxy.cert",
+    "--hidden-import=mitmproxy.connection",
+    "--hidden-import=mitmproxy.ctx",
     "--hidden-import=asyncio",
     "--hidden-import=threading",
     "--hidden-import=queue",
     "--hidden-import=ssl",
     "--hidden-import=OpenSSL",
+    "--hidden-import=cryptography",
+    "--hidden-import=urllib3",
     
-    # Collect all (paling penting)
+    # Collect All (super lengkap)
     "--collect-all=PyQt6",
     "--collect-all=PyQt6-Qt6",
     "--collect-all=mitmproxy",
     "--collect-all=cryptography",
+    "--collect-all=OpenSSL",
     
-    # Tambahan untuk menghindari error common
-    "--additional-hooks-dir=.",
-    "--runtime-hook=hook-mitmproxy.py" if Path("hook-mitmproxy.py").exists() else "",
+    # Performance & Stability
+    "--log-level=WARN",
     
     "main.py"
 ]
 
-# Filter empty string
-build_args = [arg for arg in build_args if arg]
-
 if __name__ == "__main__":
-    print("[BUILD] Building Hermes HAR Recorder (Full Mode)...")
-    print("[BUILD] Using one-dir mode for better stability")
+    print("🚀 Starting ULTIMATE BUILD Hermes HAR Recorder...")
+    print("📦 Mode: one-dir | Full collect | Max hidden imports")
     
-    result = os.system(" ".join(build_args))
+    result = os.system(" ".join(build_cmd))
     
     if result == 0:
-        print("[OK] Build berhasil!")
-        print("[OK] Cek folder: dist/HermesHARRecorder")
+        print("✅ BUILD BERHASIL!")
+        print("📁 Cek folder: dist/HermesHARRecorder")
+        print("💡 Jalankan: dist/HermesHARRecorder/HermesHARRecorder.exe")
     else:
-        print("[FAIL] Build gagal. Coba cek error di atas.")
+        print("❌ Build gagal. Kirim errornya ke aku.")
