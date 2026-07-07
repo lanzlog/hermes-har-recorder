@@ -8,7 +8,6 @@ import sys
 import json
 import time
 import copy
-import atexit
 from pathlib import Path
 from typing import List, Optional, Dict, Set
 from datetime import datetime
@@ -31,7 +30,7 @@ from PyQt6.QtGui import (
     QAction, QKeySequence, QIcon, QClipboard, QBrush,
 )
 
-from proxy_engine import CapturedRequest, AppMode, unset_system_proxy
+from proxy_engine import CapturedRequest
 from utils import (
     format_size, format_duration, get_mime_category, is_static_resource,
     generate_session_name, get_status_class, detect_oauth_flow,
@@ -43,7 +42,6 @@ from export_manager import (
     export_selected_har, save_csv, save_json,
 )
 from replay_engine import ReplayEngine, replay_request, EditRequestDialog
-from trace_engine import TraceEngine, InterceptedRequest
 
 
 # ─── Syntax Highlighting ──────────────────────────────────────────────────────
@@ -313,192 +311,6 @@ class WaterfallWidget(QWidget):
         painter.end()
 
 
-# ─── Intercept Rules Dialog ────────────────────────────────────────────────
-
-class InterceptRulesDialog(QDialog):
-    """Dialog for managing API trace intercept rules."""
-
-    def __init__(self, trace_engine, parent=None):
-        super().__init__(parent)
-        self._trace_engine = trace_engine
-        self.setWindowTitle("Intercept Rules - API Trace Mode")
-        self.setMinimumSize(600, 450)
-
-        layout = QVBoxLayout(self)
-
-        # ── Add Rule Section ──
-        add_group = QGroupBox("Add New Rule")
-        add_layout = QGridLayout(add_group)
-
-        add_layout.addWidget(QLabel("Pattern:"), 0, 0)
-        self.pattern_edit = QLineEdit()
-        self.pattern_edit.setPlaceholderText("e.g. /api/ or https://example.com/v1/")
-        add_layout.addWidget(self.pattern_edit, 0, 1, 1, 2)
-
-        add_layout.addWidget(QLabel("Match Type:"), 1, 0)
-        self.match_combo = QComboBox()
-        self.match_combo.addItems(["Contains", "Regex", "Exact URL", "Prefix"])
-        self.match_combo.setCurrentText("Contains")
-        add_layout.addWidget(self.match_combo, 1, 1)
-
-        add_layout.addWidget(QLabel("Method:"), 1, 2)
-        self.method_combo = QComboBox()
-        self.method_combo.addItems(["ALL", "GET", "POST", "PUT", "PATCH", "DELETE"])
-        add_layout.addWidget(self.method_combo, 1, 3)
-
-        btn_add = QPushButton("➕ Add Rule")
-        btn_add.setStyleSheet("background-color: #3E5C3E; color: #98C379; font-weight: bold;")
-        btn_add.clicked.connect(self._add_rule)
-        add_layout.addWidget(btn_add, 0, 3)
-
-        layout.addWidget(add_group)
-
-        # ── Rules List ──
-        layout.addWidget(QLabel("Active Rules:"))
-
-        self.rules_list = QTableWidget()
-        self.rules_list.setColumnCount(4)
-        self.rules_list.setHorizontalHeaderLabels(["Pattern", "Match Type", "Method", "Actions"])
-        header = self.rules_list.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        self.rules_list.setColumnWidth(1, 120)
-        self.rules_list.setColumnWidth(2, 80)
-        self.rules_list.setColumnWidth(3, 80)
-        self.rules_list.verticalHeader().setVisible(False)
-        self.rules_list.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        layout.addWidget(self.rules_list)
-
-        # ── Buttons ──
-        btn_layout = QHBoxLayout()
-
-        btn_remove_selected = QPushButton("🗑 Remove Selected")
-        btn_remove_selected.clicked.connect(self._remove_selected)
-        btn_layout.addWidget(btn_remove_selected)
-
-        btn_clear_all = QPushButton("Clear All Rules")
-        btn_clear_all.clicked.connect(self._clear_all)
-        btn_layout.addWidget(btn_clear_all)
-
-        btn_layout.addStretch()
-
-        btn_close = QPushButton("Close")
-        btn_close.clicked.connect(self.accept)
-        btn_layout.addWidget(btn_close)
-
-        layout.addLayout(btn_layout)
-
-        # Load existing rules
-        self._refresh_rules_list()
-        self.rules_list.cellClicked.connect(self._on_rule_cell_clicked)
-
-    def _get_match_type_key(self, display: str) -> str:
-        """Convert display name to key."""
-        mapping = {
-            "Contains": "contains",
-            "Regex": "regex",
-            "Exact URL": "exact",
-            "Prefix": "prefix",
-        }
-        return mapping.get(display, "contains")
-
-    def _get_match_type_display(self, key: str) -> str:
-        """Convert key to display name."""
-        mapping = {
-            "contains": "Contains",
-            "regex": "Regex",
-            "exact": "Exact URL",
-            "prefix": "Prefix",
-        }
-        return mapping.get(key, key)
-
-    def _add_rule(self):
-        """Add a new intercept rule."""
-        pattern = self.pattern_edit.text().strip()
-        if not pattern:
-            QMessageBox.warning(self, "Add Rule", "Pattern cannot be empty.")
-            return
-
-        match_type = self._get_match_type_key(self.match_combo.currentText())
-        method_filter = self.method_combo.currentText()
-
-        # Validate regex
-        if match_type == "regex":
-            import re
-            try:
-                re.compile(pattern)
-            except re.error as e:
-                QMessageBox.warning(self, "Invalid Regex", f"Invalid regular expression:\n{e}")
-                return
-
-        self._trace_engine.add_rule(pattern, match_type, method_filter)
-        self.pattern_edit.clear()
-        self._refresh_rules_list()
-
-    def _refresh_rules_list(self):
-        """Refresh the rules table."""
-        self.rules_list.setRowCount(0)
-        rules = self._trace_engine.intercept_rules
-
-        for i, rule in enumerate(rules):
-            row = self.rules_list.rowCount()
-            self.rules_list.insertRow(row)
-
-            pattern_item = QTableWidgetItem(rule.pattern)
-            pattern_item.setData(Qt.ItemDataRole.UserRole, i)
-            self.rules_list.setItem(row, 0, pattern_item)
-
-            type_item = QTableWidgetItem(self._get_match_type_display(rule.match_type))
-            type_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.rules_list.setItem(row, 1, type_item)
-
-            method_item = QTableWidgetItem(rule.method_filter)
-            method_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.rules_list.setItem(row, 2, method_item)
-
-            remove_item = QTableWidgetItem("✕ Remove")
-            remove_item.setForeground(QColor("#E06C75"))
-            remove_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            remove_item.setData(Qt.ItemDataRole.UserRole + 1, i)
-            self.rules_list.setItem(row, 3, remove_item)
-
-    def _on_rule_cell_clicked(self, row, col):
-        """Handle click on rule row, especially the remove column."""
-        if col == 3:  # Actions column
-            item = self.rules_list.item(row, col)
-            if item:
-                idx = item.data(Qt.ItemDataRole.UserRole + 1)
-                if idx is not None:
-                    self._trace_engine.remove_rule(idx)
-                    self._refresh_rules_list()
-
-    def _remove_selected(self):
-        """Remove selected rule."""
-        rows = self.rules_list.selectionModel().selectedRows()
-        if not rows:
-            return
-        row = rows[0].row()
-        item = self.rules_list.item(row, 0)
-        if item:
-            idx = item.data(Qt.ItemDataRole.UserRole)
-            if idx is not None:
-                self._trace_engine.remove_rule(idx)
-                self._refresh_rules_list()
-
-    def _clear_all(self):
-        """Clear all rules."""
-        if self._trace_engine.intercept_rules:
-            reply = QMessageBox.question(
-                self, "Clear Rules", "Remove all intercept rules?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.Yes:
-                self._trace_engine.clear_rules()
-                self._refresh_rules_list()
-
-
 # ─── Main Window ──────────────────────────────────────────────────────────────
 
 class HARRecorderWindow(QMainWindow):
@@ -508,8 +320,6 @@ class HARRecorderWindow(QMainWindow):
     flow_received = pyqtSignal(object)  # CapturedRequest
     proxy_error = pyqtSignal(str)
     replay_complete = pyqtSignal(object, object)  # flow, ReplayResult
-    request_intercepted = pyqtSignal(object)  # InterceptedRequest
-    request_trace_completed = pyqtSignal(object)  # InterceptedRequest
 
     def __init__(self, config: dict):
         super().__init__()
@@ -520,12 +330,6 @@ class HARRecorderWindow(QMainWindow):
         self._domains: Set[str] = set()
         self._step_markers: List[Dict] = []
         self._recording = False
-        self._app_mode = AppMode.HAR_RECORD  # Current mode
-
-        # Trace engine
-        self._trace_engine = TraceEngine()
-        self._trace_engine.on_request_intercepted = self._emit_intercepted
-        self._trace_engine.on_request_completed = lambda req: self.request_trace_completed.emit(req)
 
         # Replay engine
         self._replay_engine = ReplayEngine(
@@ -536,10 +340,6 @@ class HARRecorderWindow(QMainWindow):
         self._connect_signals()
         self._apply_dark_theme()
         self._restore_session()
-
-        # Honor always_on_top from config
-        if self.config.get("always_on_top", False):
-            self._toggle_on_top(True)
 
         # Auto-save timer
         self._auto_save_timer = QTimer()
@@ -587,37 +387,6 @@ class HARRecorderWindow(QMainWindow):
         self.btn_clear.setToolTip("Clear all captured requests")
         self.btn_clear.setFixedHeight(36)
         toolbar_layout.addWidget(self.btn_clear)
-
-        # Separator
-        sep = QLabel("|")
-        sep.setFixedWidth(8)
-        toolbar_layout.addWidget(sep)
-
-        # Mode buttons (4 modes)
-        self._mode_buttons = {}
-        modes = [
-            ("record", "⚪ Record", "Basic recording - capture all traffic"),
-            ("har_record", "🔵 HAR", "Record + HAR export"),
-            ("api_trace", "🟣 Trace", "Intercept API requests only"),
-            ("har_trace", "🟢 HAR+Trace", "Record HAR + intercept API"),
-        ]
-        for mode_id, label, tooltip in modes:
-            btn = QPushButton(label)
-            btn.setToolTip(tooltip)
-            btn.setFixedHeight(36)
-            btn.setCheckable(True)
-            btn.setStyleSheet("font-weight:bold; padding: 6px 10px;")
-            toolbar_layout.addWidget(btn)
-            self._mode_buttons[mode_id] = btn
-
-        # Default: HAR Record mode
-        self._mode_buttons["har_record"].setChecked(True)
-        self._mode_buttons["har_record"].setStyleSheet("font-weight:bold; padding: 6px 10px; background-color: #3E4451;")
-
-        # Separator
-        sep2 = QLabel("|")
-        sep2.setFixedWidth(8)
-        toolbar_layout.addWidget(sep2)
 
         self.btn_export = QPushButton("📁 Export")
         self.btn_export.setToolTip("Export captured data (Ctrl+E)")
@@ -677,9 +446,7 @@ class HARRecorderWindow(QMainWindow):
         self.chk_hide_static.setChecked(self.config.get("hide_static", False))
         filter_layout.addWidget(self.chk_hide_static)
 
-        self._filter_bar_widget = QWidget()
-        self._filter_bar_widget.setLayout(filter_layout)
-        main_layout.addWidget(self._filter_bar_widget)
+        main_layout.addLayout(filter_layout)
 
         # ── Main Splitter ──
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -756,18 +523,7 @@ class HARRecorderWindow(QMainWindow):
         splitter.addWidget(detail_widget)
 
         splitter.setSizes([400, 350])
-
-        # Store HAR view reference
-        self._har_view = splitter
-
-        # ── Trace Panel ──
-        self._trace_panel = self._build_trace_panel()
-        self._trace_panel.setVisible(False)
-
-        # Add both to main layout (visibility controlled by mode switching)
-        main_layout.addWidget(self._har_view, stretch=3)
-        main_layout.addWidget(self._trace_panel, stretch=2)
-
+        main_layout.addWidget(splitter)
 
         # ── Menu Bar ──
         self._build_menu_bar()
@@ -796,7 +552,6 @@ class HARRecorderWindow(QMainWindow):
         act_export = QAction("Export...", self)
         act_export.setShortcut(QKeySequence("Ctrl+E"))
         act_export.triggered.connect(self._on_export)
-        self._act_export = act_export
         file_menu.addAction(act_export)
 
         file_menu.addSeparator()
@@ -826,21 +581,6 @@ class HARRecorderWindow(QMainWindow):
         self.act_on_top.triggered.connect(self._toggle_on_top)
         view_menu.addAction(self.act_on_top)
 
-        view_menu.addSeparator()
-
-        view_menu.addSeparator()
-        mode_shortcuts = [
-            ("record", "Record Mode", "Ctrl+1"),
-            ("har_record", "HAR Record Mode", "Ctrl+2"),
-            ("api_trace", "API Trace Mode", "Ctrl+3"),
-            ("har_trace", "HAR + Trace Mode", "Ctrl+4"),
-        ]
-        for mode_id, label, shortcut in mode_shortcuts:
-            act = QAction(label, self)
-            act.setShortcut(QKeySequence(shortcut))
-            act.triggered.connect(lambda checked, m=mode_id: self._switch_mode(m))
-            view_menu.addAction(act)
-
         # Tools menu
         tools_menu = menubar.addMenu("Tools")
         act_step = QAction("Add Step Marker", self)
@@ -852,35 +592,11 @@ class HARRecorderWindow(QMainWindow):
         act_extract.triggered.connect(self._extract_all_tokens)
         tools_menu.addAction(act_extract)
 
-        tools_menu.addSeparator()
-
-        act_manage_rules = QAction("Intercept Rules...", self)
-        act_manage_rules.setShortcut(QKeySequence("Ctrl+I"))
-        act_manage_rules.triggered.connect(self._show_intercept_rules_dialog)
-        tools_menu.addAction(act_manage_rules)
-
-        # Settings menu
-        settings_menu = menubar.addMenu("Settings")
-        act_port = QAction("Change Proxy Port...", self)
-        act_port.triggered.connect(self._change_port)
-        settings_menu.addAction(act_port)
-
-        self.act_auto_proxy = QAction("Auto-set System Proxy", self)
-        self.act_auto_proxy.setCheckable(True)
-        self.act_auto_proxy.setChecked(self.config.get("auto_set_proxy", True))
-        self.act_auto_proxy.triggered.connect(self._toggle_auto_proxy)
-        settings_menu.addAction(self.act_auto_proxy)
-
         # Help menu
         help_menu = menubar.addMenu("Help")
         act_about = QAction("About", self)
         act_about.triggered.connect(self._show_about)
         help_menu.addAction(act_about)
-
-        help_menu.addSeparator()
-        act_cert = QAction("Install HTTPS Certificate...", self)
-        act_cert.triggered.connect(self._show_cert_install)
-        help_menu.addAction(act_cert)
 
     def _connect_signals(self):
         """Connect signals and slots."""
@@ -889,22 +605,9 @@ class HARRecorderWindow(QMainWindow):
         self.btn_clear.clicked.connect(self._on_clear)
         self.btn_export.clicked.connect(self._on_export)
 
-        # Mode toggle
-        for mode_id, btn in self._mode_buttons.items():
-            btn.clicked.connect(lambda checked, m=mode_id: self._switch_mode(m))
-
-        # Delete key shortcut (window-level so it works without context menu open)
-        self._act_delete = QAction("Remove Selected", self)
-        self._act_delete.setShortcut(QKeySequence("Delete"))
-        self._act_delete.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
-        self._act_delete.triggered.connect(self._remove_selected)
-        self.addAction(self._act_delete)
-
         self.flow_received.connect(self._on_flow_received)
         self.proxy_error.connect(self._on_proxy_error)
         self.replay_complete.connect(self._on_replay_complete)
-        self.request_intercepted.connect(self._on_request_intercepted)
-        self.request_trace_completed.connect(lambda req: self._update_trace_counts())
 
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         self.table.customContextMenuRequested.connect(self._on_context_menu)
@@ -1052,499 +755,6 @@ class HARRecorderWindow(QMainWindow):
             }
         """)
 
-    # ─── Trace Mode UI ────────────────────────────────────────────────────────
-
-    def _build_trace_panel(self) -> QWidget:
-        """Build the API Trace / Intercept panel."""
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)
-
-        # ── Intercept Controls ──
-        controls_layout = QHBoxLayout()
-
-        self.chk_intercept = QCheckBox("🔴 Intercept: OFF")
-        self.chk_intercept.setStyleSheet("font-weight: bold; font-size: 12px;")
-        self.chk_intercept.stateChanged.connect(self._toggle_intercept)
-        controls_layout.addWidget(self.chk_intercept)
-
-        controls_layout.addSpacing(20)
-
-        # Rules display
-        self.lbl_rules = QLabel("Rules: (none)")
-        self.lbl_rules.setStyleSheet("color: #5C6370;")
-        controls_layout.addWidget(self.lbl_rules)
-
-        btn_manage_rules = QPushButton("⚙️ Manage Rules")
-        btn_manage_rules.setFixedHeight(30)
-        btn_manage_rules.clicked.connect(self._show_intercept_rules_dialog)
-        controls_layout.addWidget(btn_manage_rules)
-
-        controls_layout.addStretch()
-        layout.addLayout(controls_layout)
-
-        # ── Splitter: Request list + Detail ──
-        trace_splitter = QSplitter(Qt.Orientation.Vertical)
-
-        # Intercepted requests table
-        self.trace_table = QTableWidget()
-        self.trace_table.setColumnCount(5)
-        self.trace_table.setHorizontalHeaderLabels([
-            "Status", "Method", "URL", "Timestamp", "Actions"
-        ])
-        header = self.trace_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
-        self.trace_table.setColumnWidth(0, 100)
-        self.trace_table.setColumnWidth(1, 80)
-        self.trace_table.setColumnWidth(3, 100)
-        self.trace_table.setColumnWidth(4, 250)
-        self.trace_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.trace_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.trace_table.setAlternatingRowColors(True)
-        self.trace_table.verticalHeader().setVisible(False)
-        self.trace_table.itemSelectionChanged.connect(self._on_trace_selection_changed)
-
-        trace_splitter.addWidget(self.trace_table)
-
-        # Detail panel for intercepted request
-        trace_detail_widget = QWidget()
-        trace_detail_layout = QVBoxLayout(trace_detail_widget)
-        trace_detail_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.trace_detail_tabs = QTabWidget()
-
-        # Headers tab
-        self.trace_headers_text = QTextBrowser()
-        self.trace_headers_text.setOpenExternalLinks(False)
-        self.trace_detail_tabs.addTab(self.trace_headers_text, "Headers")
-
-        # Body tab
-        self.trace_body_text = QPlainTextEdit()
-        self.trace_body_text.setReadOnly(True)
-        self.trace_detail_tabs.addTab(self.trace_body_text, "Body")
-
-        # Raw request tab
-        self.trace_raw_text = QPlainTextEdit()
-        self.trace_raw_text.setReadOnly(True)
-        self.trace_raw_text.setFont(QFont("Consolas", 10))
-        self.trace_detail_tabs.addTab(self.trace_raw_text, "Raw")
-
-        trace_detail_layout.addWidget(self.trace_detail_tabs)
-
-        # Action buttons for selected request
-        action_layout = QHBoxLayout()
-
-        btn_forward = QPushButton("▶ Forward")
-        btn_forward.setStyleSheet("background-color: #3E5C3E; color: #98C379; font-weight: bold; padding: 8px 16px;")
-        btn_forward.clicked.connect(self._trace_forward_selected)
-        action_layout.addWidget(btn_forward)
-
-        btn_drop = QPushButton("✕ Drop")
-        btn_drop.setStyleSheet("background-color: #5C3E3E; color: #E06C75; font-weight: bold; padding: 8px 16px;")
-        btn_drop.clicked.connect(self._trace_drop_selected)
-        action_layout.addWidget(btn_drop)
-
-        btn_edit_fwd = QPushButton("✏️ Edit & Forward")
-        btn_edit_fwd.setStyleSheet("background-color: #3E3E5C; color: #61AFEF; font-weight: bold; padding: 8px 16px;")
-        btn_edit_fwd.clicked.connect(self._trace_edit_and_forward)
-        action_layout.addWidget(btn_edit_fwd)
-
-        action_layout.addStretch()
-
-        btn_forward_all = QPushButton("▶ Forward All")
-        btn_forward_all.setStyleSheet("background-color: #2D4A2D; padding: 8px 16px;")
-        btn_forward_all.clicked.connect(self._trace_forward_all)
-        action_layout.addWidget(btn_forward_all)
-
-        btn_drop_all = QPushButton("✕ Drop All")
-        btn_drop_all.setStyleSheet("background-color: #4A2D2D; padding: 8px 16px;")
-        btn_drop_all.clicked.connect(self._trace_drop_all)
-        action_layout.addWidget(btn_drop_all)
-
-        trace_detail_layout.addLayout(action_layout)
-
-        trace_splitter.addWidget(trace_detail_widget)
-        trace_splitter.setSizes([300, 400])
-
-        layout.addWidget(trace_splitter)
-
-        # ── History ──
-        self.lbl_trace_history = QLabel("Completed: 0 intercepted, 0 forwarded, 0 dropped")
-        self.lbl_trace_history.setStyleSheet("color: #5C6370;")
-        layout.addWidget(self.lbl_trace_history)
-
-        return panel
-
-    def _toggle_intercept(self, state):
-        """Toggle intercept on/off."""
-        enabled = self.chk_intercept.isChecked()
-
-        # If turning OFF with pending requests, prompt user
-        if not enabled and hasattr(self, '_trace_engine'):
-            pending = self._trace_engine.get_pending_count() if hasattr(self._trace_engine, 'get_pending_count') else len(self._trace_engine._queue)
-            if pending > 0:
-                reply = QMessageBox.question(
-                    self, "Pending Requests",
-                    f"{pending} request(s) still intercepted and waiting.\nWhat do you want to do?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
-                )
-                # Yes = Forward All, No = Drop All, Cancel = keep intercept on
-                if reply == QMessageBox.StandardButton.Cancel:
-                    self.chk_intercept.blockSignals(True)
-                    self.chk_intercept.setChecked(True)
-                    self.chk_intercept.blockSignals(False)
-                    return
-                elif reply == QMessageBox.StandardButton.Yes:
-                    self._trace_engine.forward_all()
-                else:
-                    self._trace_engine.drop_all()
-
-        self._trace_engine.intercept_enabled = enabled
-        if enabled:
-            self.chk_intercept.setText("🔴 Intercept: ON")
-            self.chk_intercept.setStyleSheet("font-weight: bold; font-size: 12px; color: #E06C75;")
-            self.statusBar().showMessage("Intercept enabled - matching requests will be paused")
-        else:
-            self.chk_intercept.setText("🔴 Intercept: OFF")
-            self.chk_intercept.setStyleSheet("font-weight: bold; font-size: 12px;")
-            self.statusBar().showMessage("Intercept disabled")
-
-    def _show_intercept_rules_dialog(self):
-        """Show the intercept rules management dialog."""
-        dlg = InterceptRulesDialog(self._trace_engine, self)
-        dlg.exec()
-        self._update_rules_display()
-
-    def _update_rules_display(self):
-        """Update the rules label in the trace panel."""
-        rules = self._trace_engine.get_rules_display()
-        if rules:
-            self.lbl_rules.setText(f"Rules: {', '.join(rules[:3])}" +
-                                   (f" (+{len(rules)-3} more)" if len(rules) > 3 else ""))
-            self.lbl_rules.setStyleSheet("color: #E5C07B;")
-        else:
-            self.lbl_rules.setText("Rules: (intercept all when ON)")
-            self.lbl_rules.setStyleSheet("color: #5C6370;")
-
-    def _emit_intercepted(self, intercepted: InterceptedRequest):
-        """Thread-safe emission of intercepted request signal."""
-        self.request_intercepted.emit(intercepted)
-
-    def _on_request_intercepted(self, intercepted: InterceptedRequest):
-        """Handle a new intercepted request (main thread)."""
-        self._add_trace_table_row(intercepted)
-        self._update_trace_counts()
-        self.statusBar().showMessage(
-            f"⏸️ Intercepted: {intercepted.method} {intercepted.url[:80]}")
-
-    def _add_trace_table_row(self, req: InterceptedRequest):
-        """Add a row to the trace table."""
-        row = self.trace_table.rowCount()
-        self.trace_table.insertRow(row)
-
-        # Status
-        status_icons = {
-            "intercepted": "⏸️",
-            "forwarded": "▶️",
-            "dropped": "✕",
-            "modified": "✏️",
-        }
-        status_item = QTableWidgetItem(f"{status_icons.get(req.status, '?')} {req.status}")
-        status_item.setData(Qt.ItemDataRole.UserRole, req.id)
-
-        status_colors = {
-            "intercepted": "#E5C07B",
-            "forwarded": "#98C379",
-            "dropped": "#E06C75",
-            "modified": "#61AFEF",
-        }
-        status_item.setForeground(QColor(status_colors.get(req.status, "#ABB2BF")))
-        status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.trace_table.setItem(row, 0, status_item)
-
-        # Method
-        method_item = QTableWidgetItem(req.method)
-        method_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        method_colors = {
-            "GET": "#61AFEF", "POST": "#98C379", "PUT": "#E5C07B",
-            "PATCH": "#D19A66", "DELETE": "#E06C75",
-        }
-        method_item.setForeground(QColor(method_colors.get(req.method, "#ABB2BF")))
-        self.trace_table.setItem(row, 1, method_item)
-
-        # URL
-        url_item = QTableWidgetItem(req.url)
-        url_item.setToolTip(req.url)
-        self.trace_table.setItem(row, 2, url_item)
-
-        # Timestamp
-        time_str = datetime.fromtimestamp(req.timestamp).strftime("%H:%M:%S.%f")[:-3]
-        time_item = QTableWidgetItem(time_str)
-        time_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.trace_table.setItem(row, 3, time_item)
-
-        # Actions (only for intercepted status)
-        actions_item = QTableWidgetItem()
-        if req.status == "intercepted":
-            actions_item.setText("▶ Forward  |  ✕ Drop  |  ✏️ Edit")
-            actions_item.setForeground(QColor("#ABB2BF"))
-        else:
-            actions_item.setText(f"[{req.status}]")
-            actions_item.setForeground(QColor("#5C6370"))
-        actions_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.trace_table.setItem(row, 4, actions_item)
-
-        # Auto-scroll
-        self.trace_table.scrollToBottom()
-
-    def _on_trace_selection_changed(self):
-        """Handle trace table selection change."""
-        rows = self.trace_table.selectionModel().selectedRows()
-        if not rows:
-            return
-
-        row = rows[0].row()
-        item = self.trace_table.item(row, 0)
-        if not item:
-            return
-
-        req_id = item.data(Qt.ItemDataRole.UserRole)
-        req = self._trace_engine.get_request_by_id(req_id)
-        if req:
-            self._show_trace_detail(req)
-
-    def _show_trace_detail(self, req: InterceptedRequest):
-        """Show detail for an intercepted request."""
-        # Headers tab
-        status_colors = {
-            "intercepted": "#E5C07B",
-            "forwarded": "#98C379",
-            "dropped": "#E06C75",
-            "modified": "#61AFEF",
-        }
-        status_color = status_colors.get(req.status, "#ABB2BF")
-        html = f"<h3 style='color:#E5C07B;'>{req.method} {req.url}</h3>"
-        html += f"<p style='color:#5C6370;'>Status: <b style='color:{status_color};'>{req.status}</b></p>"
-        html += "<h3 style='color:#61AFEF;'>Request Headers</h3>"
-        html += "<table style='color:#ABB2BF;'>"
-        for k, v in req.headers.items():
-            html += f"<tr><td style='color:#E5C07B; padding-right:10px;'><b>{k}</b></td><td>{v}</td></tr>"
-        html += "</table>"
-        self.trace_headers_text.setHtml(html)
-
-        # Body tab
-        self.trace_body_text.setPlainText(req.body or "(empty body)")
-        if 'json' in req.content_type.lower():
-            JSONHighlighter(self.trace_body_text.document())
-
-        # Raw tab
-        raw_lines = [f"{req.method} {req.path} HTTP/1.1"]
-        for k, v in req.headers.items():
-            raw_lines.append(f"{k}: {v}")
-        raw_lines.append("")
-        raw_lines.append(req.body or "")
-        self.trace_raw_text.setPlainText("\n".join(raw_lines))
-
-    def _get_selected_trace_request(self) -> Optional[InterceptedRequest]:
-        """Get the currently selected intercepted request."""
-        rows = self.trace_table.selectionModel().selectedRows()
-        if not rows:
-            return None
-
-        row = rows[0].row()
-        item = self.trace_table.item(row, 0)
-        if not item:
-            return None
-
-        req_id = item.data(Qt.ItemDataRole.UserRole)
-        return self._trace_engine.get_request_by_id(req_id)
-
-    def _trace_forward_selected(self):
-        """Forward the selected intercepted request."""
-        req = self._get_selected_trace_request()
-        if not req:
-            QMessageBox.information(self, "Forward", "No request selected.")
-            return
-        if req.status != "intercepted":
-            QMessageBox.information(self, "Forward", "Request is not in intercepted state.")
-            return
-
-        if self._trace_engine.forward_request(req.id):
-            self._refresh_trace_table()
-            self.statusBar().showMessage(f"▶ Forwarded: {req.method} {req.url[:60]}")
-        else:
-            QMessageBox.warning(self, "Error", "Failed to forward request.")
-
-    def _trace_drop_selected(self):
-        """Drop the selected intercepted request."""
-        req = self._get_selected_trace_request()
-        if not req:
-            QMessageBox.information(self, "Drop", "No request selected.")
-            return
-        if req.status != "intercepted":
-            QMessageBox.information(self, "Drop", "Request is not in intercepted state.")
-            return
-
-        reply = QMessageBox.question(
-            self, "Drop Request",
-            f"Drop this request? The server will not receive it.\n\n{req.method} {req.url[:100]}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            if self._trace_engine.drop_request(req.id):
-                self._refresh_trace_table()
-                self.statusBar().showMessage(f"✕ Dropped: {req.method} {req.url[:60]}")
-
-    def _trace_edit_and_forward(self):
-        """Edit an intercepted request and forward it."""
-        req = self._get_selected_trace_request()
-        if not req:
-            QMessageBox.information(self, "Edit", "No request selected.")
-            return
-        if req.status != "intercepted":
-            QMessageBox.information(self, "Edit", "Request is not in intercepted state.")
-            return
-
-        # Create a CapturedRequest-like object for the edit dialog
-        flow = CapturedRequest()
-        flow.method = req.method
-        flow.url = req.url
-        flow.request_headers = req.headers
-        flow.request_body_text = req.body
-
-        dlg = EditRequestDialogUI(flow, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            data = dlg.get_modified_data()
-            if self._trace_engine.forward_request(req.id, modified_data=data):
-                self._refresh_trace_table()
-                self.statusBar().showMessage(f"✏️ Modified & Forwarded: {data['method']} {data['url'][:60]}")
-            else:
-                QMessageBox.warning(self, "Error", "Failed to forward modified request.")
-
-    def _trace_forward_all(self):
-        """Forward all pending intercepted requests."""
-        count = self._trace_engine.get_pending_count()
-        if count == 0:
-            QMessageBox.information(self, "Forward All", "No intercepted requests pending.")
-            return
-
-        reply = QMessageBox.question(
-            self, "Forward All",
-            f"Forward all {count} intercepted request(s)?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            self._trace_engine.forward_all()
-            self._refresh_trace_table()
-            self.statusBar().showMessage(f"▶ Forwarded {count} requests")
-
-    def _trace_drop_all(self):
-        """Drop all pending intercepted requests."""
-        count = self._trace_engine.get_pending_count()
-        if count == 0:
-            QMessageBox.information(self, "Drop All", "No intercepted requests pending.")
-            return
-
-        reply = QMessageBox.question(
-            self, "Drop All",
-            f"Drop all {count} intercepted request(s)?\nThese requests will NOT reach the server.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            self._trace_engine.drop_all()
-            self._refresh_trace_table()
-            self.statusBar().showMessage(f"✕ Dropped {count} requests")
-
-    def _refresh_trace_table(self):
-        """Refresh the trace table from trace engine state."""
-        self.trace_table.setRowCount(0)
-
-        # Show all requests (pending first, then completed)
-        pending = self._trace_engine.get_pending_requests()
-        completed = self._trace_engine.get_completed_requests()
-
-        for req in pending + completed:
-            self._add_trace_table_row(req)
-
-        self._update_trace_counts()
-
-    def _update_trace_counts(self):
-        """Update the trace history label."""
-        completed = self._trace_engine.get_completed_requests()
-        forwarded = sum(1 for r in completed if r.status in ("forwarded", "modified"))
-        dropped = sum(1 for r in completed if r.status == "dropped")
-        pending = self._trace_engine.get_pending_count()
-        self.lbl_trace_history.setText(
-            f"Pending: {pending} | Forwarded: {forwarded} | Dropped: {dropped} | Total: {len(completed)}"
-        )
-
-    # ─── Mode Switching ──────────────────────────────────────────────────────
-
-    def _switch_mode(self, mode_id: str):
-        """Switch to specified mode."""
-        mode_map = {
-            "record": AppMode.RECORD,
-            "har_record": AppMode.HAR_RECORD,
-            "api_trace": AppMode.API_TRACE,
-            "har_trace": AppMode.HAR_TRACE,
-        }
-        self._app_mode = mode_map.get(mode_id, AppMode.HAR_RECORD)
-
-        # Update button styles
-        for mid, btn in self._mode_buttons.items():
-            if mid == mode_id:
-                btn.setChecked(True)
-                btn.setStyleSheet("font-weight:bold; padding: 6px 10px; background-color: #3E4451;")
-            else:
-                btn.setChecked(False)
-                btn.setStyleSheet("font-weight:bold; padding: 6px 10px;")
-
-        # Show/hide panels based on mode
-        has_trace = mode_id in ("api_trace", "har_trace")
-        has_har = mode_id in ("record", "har_record", "har_trace")
-        is_combined = mode_id == "har_trace"
-
-        if is_combined:
-            # Combined: show both HAR view and trace panel
-            self._har_view.setVisible(True)
-            self._trace_panel.setVisible(True)
-        elif has_trace and not has_har:
-            # Trace only: hide HAR, show trace
-            self._har_view.setVisible(False)
-            self._trace_panel.setVisible(True)
-        else:
-            # Record or HAR Record: show HAR, hide trace
-            self._har_view.setVisible(True)
-            self._trace_panel.setVisible(False)
-
-        self._filter_bar_widget.setVisible(has_har)
-
-        # Disable export in basic Record mode (no HAR formatting)
-        can_export = mode_id != "record"
-        self.btn_export.setEnabled(can_export)
-        if hasattr(self, '_act_export'):
-            self._act_export.setEnabled(can_export)
-
-        # Update proxy engine mode if recording
-        if self._recording and hasattr(self, '_proxy_engine'):
-            self._proxy_engine.set_mode(self._app_mode)
-
-        if has_trace:
-            self._update_rules_display()
-
-        mode_names = {
-            "record": "Record Mode (basic capture)",
-            "har_record": "HAR Record Mode",
-            "api_trace": "API Trace Mode (intercept only)",
-            "har_trace": "HAR + Trace Mode (record + intercept)",
-        }
-        self.statusBar().showMessage(f"Mode: {mode_names.get(mode_id, mode_id)}")
-
     # ─── Proxy Control ────────────────────────────────────────────────────────
 
     def _on_record(self):
@@ -1560,36 +770,23 @@ class HARRecorderWindow(QMainWindow):
             port=port,
             on_flow=self._emit_flow,
             on_error=lambda e: self.proxy_error.emit(e),
-            trace_engine=self._trace_engine,
         )
 
-        # Set mode on proxy engine
-        self._proxy_engine.set_mode(self._app_mode)
-
         if self._proxy_engine.start():
-            self._recording = True
             actual_port = self._proxy_engine.port
-            # Wire event loop into trace engine for thread-safe flow ops
-            if hasattr(self, '_trace_engine') and self._trace_engine:
-                self._trace_engine.set_loop(self._proxy_engine.get_loop())
+            self._recording = True
             self.btn_record.setEnabled(False)
             self.btn_stop.setEnabled(True)
             self.lbl_proxy.setText(f"🟢 Proxy: :{actual_port}")
             self.lbl_proxy.setStyleSheet("color: #98C379;")
-            if actual_port != port:
-                self.statusBar().showMessage(f"Port {port} busy, using {actual_port}")
-            else:
-                self.statusBar().showMessage(f"Recording on port {actual_port}")
+            port_note = f" (auto: {actual_port})" if actual_port != port else ""
+            self.statusBar().showMessage(f"Recording on port {actual_port}{port_note}")
 
             # Auto-set system proxy on Windows
             if self.config.get("auto_set_proxy", True):
                 set_system_proxy(actual_port)
-                atexit.register(unset_system_proxy)
         else:
-            QMessageBox.warning(self, "Error", 
-                f"Failed to start proxy on port {port}.\n"
-                f"Port and nearby ports (8899-8918) are all in use.\n\n"
-                f"Try closing other proxy tools or change port in Settings.")
+            QMessageBox.warning(self, "Error", "Failed to start proxy. All ports in range busy.")
 
     def _emit_flow(self, captured: CapturedRequest):
         """Thread-safe flow emission."""
@@ -1869,33 +1066,20 @@ class HARRecorderWindow(QMainWindow):
 
     def _apply_highlighter(self, text_widget: QPlainTextEdit, content_type: str):
         """Apply syntax highlighting based on content type."""
-        # Track highlighters per widget to prevent memory leak
-        if not hasattr(self, '_active_highlighters'):
-            self._active_highlighters = {}
-
-        key = id(text_widget)
-        old = self._active_highlighters.get(key)
-        if old is not None:
-            try:
-                old.setDocument(None)
-                old.deleteLater()
-            except Exception:
-                pass
-            self._active_highlighters.pop(key, None)
+        # Remove existing highlighter
+        old = text_widget.document().parent()
+        if isinstance(old, QSyntaxHighlighter):
+            old.setDocument(None)
 
         ct = content_type.lower()
-        new_hl = None
         if 'json' in ct:
-            new_hl = JSONHighlighter(text_widget.document())
+            JSONHighlighter(text_widget.document())
         elif 'html' in ct:
-            new_hl = HTMLHighlighter(text_widget.document())
+            HTMLHighlighter(text_widget.document())
         elif 'css' in ct:
-            new_hl = CSSHighlighter(text_widget.document())
+            CSSHighlighter(text_widget.document())
         elif 'javascript' in ct:
-            new_hl = JSHighlighter(text_widget.document())
-
-        if new_hl is not None:
-            self._active_highlighters[key] = new_hl
+            JSHighlighter(text_widget.document())
 
     def _clear_detail(self):
         """Clear detail panels."""
@@ -2017,7 +1201,7 @@ class HARRecorderWindow(QMainWindow):
         dlg = EditRequestDialogUI(flow, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             data = dlg.get_modified_data()
-            self.statusBar().showMessage("Replaying edited request...")
+            self.statusBar().showMessage(f"Replaying edited request...")
             self._replay_engine.replay_async(
                 flow,
                 modified_url=data["url"],
@@ -2194,7 +1378,7 @@ class HARRecorderWindow(QMainWindow):
             session_data["flows"].append(fd)
 
         try:
-            with open(filepath, 'w', encoding='utf-8') as f:
+            with open(filepath, 'w') as f:
                 json.dump(session_data, f)
             self.statusBar().showMessage(f"Session saved: {filepath.name}", 3000)
             self.config["last_session"] = str(filepath)
@@ -2214,7 +1398,7 @@ class HARRecorderWindow(QMainWindow):
     def _load_session_file(self, path: str):
         """Load session from a specific file."""
         try:
-            with open(path, 'r', encoding='utf-8') as f:
+            with open(path, 'r') as f:
                 data = json.load(f)
 
             self._flows.clear()
@@ -2224,18 +1408,6 @@ class HARRecorderWindow(QMainWindow):
                     if hasattr(flow, k):
                         setattr(flow, k, v)
                 self._flows.append(flow)
-
-            # Rebuild domain filter dropdown from loaded flows
-            self._domains.clear()
-            self.filter_domain.blockSignals(True)
-            self.filter_domain.clear()
-            self.filter_domain.addItem("ALL")
-            for f in self._flows:
-                host = getattr(f, 'host', '') or ''
-                if host and host not in self._domains:
-                    self._domains.add(host)
-                    self.filter_domain.addItem(host)
-            self.filter_domain.blockSignals(False)
 
             self._step_markers = data.get("step_markers", [])
             self._apply_filters()
@@ -2286,7 +1458,7 @@ class HARRecorderWindow(QMainWindow):
                 }
                 session_data["flows"].append(fd)
             try:
-                with open(filepath, 'w', encoding='utf-8') as f:
+                with open(filepath, 'w') as f:
                     json.dump(session_data, f)
             except Exception:
                 pass
@@ -2305,82 +1477,17 @@ class HARRecorderWindow(QMainWindow):
         self.config["always_on_top"] = checked
         save_config(self.config)
 
-    def _change_port(self):
-        """Change proxy port."""
-        from PyQt6.QtWidgets import QInputDialog
-        current = self.config.get("proxy_port", 8899)
-        port, ok = QInputDialog.getInt(
-            self, "Proxy Port", "Enter proxy port:", current, 1024, 65535
-        )
-        if ok:
-            self.config["proxy_port"] = port
-            save_config(self.config)
-            self.statusBar().showMessage(f"Port changed to {port}. Restart recording to apply.")
-
-    def _toggle_auto_proxy(self, checked):
-        """Toggle auto-set system proxy."""
-        self.config["auto_set_proxy"] = checked
-        save_config(self.config)
-
     def _show_about(self):
         """Show about dialog."""
         QMessageBox.about(
             self, f"About {APP_NAME}",
             f"<h2>{APP_NAME}</h2>"
             f"<p>Version {APP_VERSION}</p>"
-            f"<p>A desktop HTTP traffic recorder, API interceptor, and HAR exporter.</p>"
-            f"<p><b>HAR Record Mode:</b> Passively captures HTTP/HTTPS traffic using mitmproxy "
-            f"with a rich UI for inspecting, filtering, and exporting requests.</p>"
-            f"<p><b>API Trace Mode:</b> Actively intercepts API requests like Burp Suite. "
-            f"Pause, inspect, modify, forward, or drop requests in real-time.</p>"
+            f"<p>A desktop HTTP traffic recorder and HAR exporter.</p>"
+            f"<p>Captures HTTP/HTTPS traffic using mitmproxy and provides "
+            f"a rich UI for inspecting, filtering, and exporting requests.</p>"
             f"<hr><p>Built with Python, PyQt6, and mitmproxy.</p>"
         )
-
-    def _show_cert_install(self):
-        """Show HTTPS certificate installation dialog."""
-        import subprocess
-        import platform
-
-        cert_dir = Path.home() / ".hermes-har-recorder" / "certs"
-        cert_path = cert_dir / "mitmproxy-ca-cert.pem"
-
-        # Try to get path from running proxy engine
-        if hasattr(self, '_proxy_engine'):
-            cert_path = Path(self._proxy_engine.get_cert_path())
-            cert_dir = cert_path.parent
-
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Install HTTPS Certificate")
-        msg.setIcon(QMessageBox.Icon.Information)
-        msg.setText("<b>To intercept HTTPS traffic, install the mitmproxy CA certificate.</b>")
-        msg.setDetailedText(
-            f"Certificate path:\n{cert_path}\n\n"
-            "Windows installation steps:\n"
-            "1. Click 'Open Certificate Folder'\n"
-            "2. Double-click mitmproxy-ca-cert.pem\n"
-            "3. Click 'Install Certificate'\n"
-            "4. Select 'Local Machine' → Next\n"
-            "5. Select 'Place all certificates in the following store'\n"
-            "6. Browse → 'Trusted Root Certification Authorities'\n"
-            "7. Click OK → Next → Finish\n"
-            "8. Restart your browser\n\n"
-            "Note: The cert is generated on first proxy start.\n"
-            "Start recording once before installing."
-        )
-        btn_open = msg.addButton("Open Cert Folder", QMessageBox.ButtonRole.ActionRole)
-        btn_copy = msg.addButton("Copy Path", QMessageBox.ButtonRole.ActionRole)
-        msg.addButton(QMessageBox.StandardButton.Close)
-        msg.exec()
-
-        clicked = msg.clickedButton()
-        if clicked == btn_open:
-            cert_dir.mkdir(parents=True, exist_ok=True)
-            if platform.system() == "Windows":
-                os.startfile(str(cert_dir))
-            else:
-                subprocess.Popen(["xdg-open", str(cert_dir)])
-        elif clicked == btn_copy:
-            QApplication.clipboard().setText(str(cert_path))
 
     def _on_proxy_error(self, error: str):
         """Handle proxy errors."""
@@ -2388,25 +1495,6 @@ class HARRecorderWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close."""
-        # Handle pending trace requests
-        pending = self._trace_engine.get_pending_count()
-        if pending > 0:
-            reply = QMessageBox.question(
-                self, "Pending Requests",
-                f"There are {pending} intercepted request(s) still pending.\n\n"
-                "Forward them before closing? (No = drop all)",
-                QMessageBox.StandardButton.Yes |
-                QMessageBox.StandardButton.No |
-                QMessageBox.StandardButton.Cancel
-            )
-            if reply == QMessageBox.StandardButton.Cancel:
-                event.ignore()
-                return
-            elif reply == QMessageBox.StandardButton.Yes:
-                self._trace_engine.forward_all()
-            else:
-                self._trace_engine.drop_all()
-
         # Save geometry
         from PyQt6.QtCore import QByteArray
         self.config["window_geometry"] = bytes(self.saveGeometry().toBase64()).decode()
