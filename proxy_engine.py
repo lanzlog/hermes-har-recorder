@@ -1,5 +1,5 @@
 """
-proxy_engine.py - FULL LENGKAP (Versi Terbaik)
+proxy_engine.py - VERSI TERBAIK (Full + 3 Mode)
 Hermes HAR Recorder
 """
 
@@ -79,8 +79,14 @@ class HARCaptureAddon:
     def __init__(self, on_flow_complete: Optional[Callable] = None):
         self.on_flow_complete = on_flow_complete
         self._flow_counter = 0
+        self._app_mode = AppMode.HAR_RECORD
+
+    def set_mode(self, mode: str):
+        self._app_mode = mode
 
     def response(self, flow: mflow.Flow):
+        if self._app_mode == AppMode.API_TRACE:
+            return
         try:
             captured = self._convert_flow(flow)
             if captured and self.on_flow_complete:
@@ -134,7 +140,8 @@ class HARCaptureAddon:
 
 
 class ProxyEngine:
-    def __init__(self, port: int = 8899, on_flow: Optional[Callable] = None, on_error: Optional[Callable] = None):
+    def __init__(self, port: int = 8899, on_flow: Optional[Callable] = None,
+                 on_error: Optional[Callable] = None, trace_engine=None):
         self.port = port
         self.on_flow = on_flow
         self.on_error = on_error
@@ -142,6 +149,10 @@ class ProxyEngine:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._addon = HARCaptureAddon(on_flow_complete=self._handle_flow)
+        self._trace_engine = trace_engine
+
+    def set_mode(self, mode: str):
+        self._addon.set_mode(mode)
 
     @staticmethod
     def is_port_available(port: int) -> bool:
