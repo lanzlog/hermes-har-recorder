@@ -1,5 +1,5 @@
 """
-proxy_engine.py - Full Version
+proxy_engine.py - FULL LENGKAP (Versi Terbaik)
 Hermes HAR Recorder
 """
 
@@ -9,6 +9,7 @@ import random
 import socket
 import threading
 import time
+import winreg
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Callable, Dict
@@ -32,7 +33,6 @@ logging.basicConfig(
 logger = logging.getLogger("hermes.proxy")
 
 
-# ==================== APP MODE ====================
 class AppMode:
     RECORD = "record"
     HAR_RECORD = "har_record"
@@ -40,7 +40,6 @@ class AppMode:
     HAR_TRACE = "har_trace"
 
 
-# ==================== DATA CLASS ====================
 @dataclass
 class CapturedRequest:
     id: str = ""
@@ -76,7 +75,6 @@ class CapturedRequest:
     trace_status: str = ""
 
 
-# ==================== ADDON ====================
 class HARCaptureAddon:
     def __init__(self, on_flow_complete: Optional[Callable] = None):
         self.on_flow_complete = on_flow_complete
@@ -135,7 +133,6 @@ class HARCaptureAddon:
         return cr
 
 
-# ==================== PROXY ENGINE ====================
 class ProxyEngine:
     def __init__(self, port: int = 8899, on_flow: Optional[Callable] = None, on_error: Optional[Callable] = None):
         self.port = port
@@ -180,10 +177,8 @@ class ProxyEngine:
                 logger.info(f"Port {self.port} busy → using random safe port: {new_port}")
                 self.port = new_port
             else:
-                err = "Tidak menemukan port tersedia di range aman"
-                logger.error(err)
                 if self.on_error:
-                    self.on_error(err)
+                    self.on_error("Tidak menemukan port tersedia di range aman")
                 return False
 
         self._thread = threading.Thread(target=self._run_proxy, daemon=True)
@@ -212,3 +207,30 @@ class ProxyEngine:
         if self._master:
             self._master.shutdown()
         self._running = False
+
+
+def set_system_proxy(host: str = "127.0.0.1", port: int = 8899):
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                             0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+        winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, f"{host}:{port}")
+        winreg.CloseKey(key)
+        return True
+    except Exception as e:
+        logger.error(f"Set system proxy failed: {e}")
+        return False
+
+
+def unset_system_proxy():
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                             0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+        winreg.CloseKey(key)
+        return True
+    except Exception as e:
+        logger.error(f"Unset system proxy failed: {e}")
+        return False
