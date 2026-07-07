@@ -1,61 +1,34 @@
-import os
-from pathlib import Path
+name: Build Hermes HAR Recorder
 
-os.chdir(Path(__file__).parent)
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
 
-# =============================================
-# Hermes HAR Recorder - ULTIMATE BUILD
-# =============================================
-
-build_cmd = [
-    "pyinstaller",
-    "--name=HermesHARRecorder",
-    "--one-dir",
-    "--windowed",
-    "--clean",
-    "--noconfirm",
-    "--noupx",
+jobs:
+  build:
+    runs-on: windows-latest
     
-    "--add-data=README.md;.",
-    "--add-data=requirements.txt;.",
-    
-    "--hidden-import=PyQt6",
-    "--hidden-import=PyQt6.QtCore",
-    "--hidden-import=PyQt6.QtGui",
-    "--hidden-import=PyQt6.QtWidgets",
-    "--hidden-import=PyQt6.sip",
-    "--hidden-import=mitmproxy",
-    "--hidden-import=mitmproxy.tools.dump",
-    "--hidden-import=mitmproxy.proxy",
-    "--hidden-import=mitmproxy.addons",
-    "--hidden-import=mitmproxy.cert",
-    "--hidden-import=mitmproxy.connection",
-    "--hidden-import=asyncio",
-    "--hidden-import=threading",
-    "--hidden-import=queue",
-    "--hidden-import=ssl",
-    "--hidden-import=OpenSSL",
-    "--hidden-import=cryptography",
-    
-    "--collect-all=PyQt6",
-    "--collect-all=PyQt6-Qt6",
-    "--collect-all=mitmproxy",
-    "--collect-all=cryptography",
-    
-    "--log-level=WARN",
-    
-    "main.py"
-]
-
-if __name__ == "__main__":
-    print("Starting ULTIMATE BUILD Hermes HAR Recorder...")
-    print("Mode: one-dir | Full collect | Max hidden imports")
-    
-    result = os.system(" ".join(build_cmd))
-    
-    if result == 0:
-        print("BUILD BERHASIL!")
-        print("Cek folder: dist/HermesHARRecorder")
-        print("Jalankan: dist/HermesHARRecorder/HermesHARRecorder.exe")
-    else:
-        print("Build gagal. Cek error di atas.")
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+          
+      - name: Build Application
+        run: python build.py
+          
+      - name: Upload Build (All dist)
+        uses: actions/upload-artifact@v4
+        with:
+          name: HermesHARRecorder-Build
+          path: dist/
+          if-no-files-found: warn
