@@ -6,7 +6,7 @@ os.chdir(Path(__file__).parent)
 build_cmd = [
     "pyinstaller",
     "--name=HermesHARRecorder",
-    "--one-dir",
+    "--onedir",                    # <--- ini yang benar
     "--windowed",
     "--clean",
     "--noconfirm",
@@ -45,7 +45,7 @@ build_cmd = [
 
 if __name__ == "__main__":
     print("Starting ULTIMATE BUILD Hermes HAR Recorder...")
-    print("Mode: one-dir | Full collect | Max hidden imports")
+    print("Mode: onedir | Full collect | Max hidden imports")
     
     result = os.system(" ".join(build_cmd))
     
