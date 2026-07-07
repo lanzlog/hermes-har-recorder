@@ -1,7 +1,6 @@
 """
-proxy_engine.py
-Hermes HAR Recorder - Proxy Engine (mitmproxy)
-Versi: Full + Random Safe Port (10000-65000)
+proxy_engine.py - Full Version
+Hermes HAR Recorder
 """
 
 import asyncio
@@ -12,7 +11,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict
 
 from mitmproxy import options as moptions
 from mitmproxy.tools.dump import DumpMaster
@@ -31,6 +30,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 logger = logging.getLogger("hermes.proxy")
+
+
+# ==================== APP MODE ====================
+class AppMode:
+    RECORD = "record"
+    HAR_RECORD = "har_record"
+    API_TRACE = "api_trace"
+    HAR_TRACE = "har_trace"
 
 
 # ==================== DATA CLASS ====================
@@ -89,7 +96,6 @@ class HARCaptureAddon:
 
         req = flow.request
         resp = flow.response
-
         self._flow_counter += 1
         start_time = getattr(flow, '_har_start_time', time.time())
 
@@ -103,21 +109,18 @@ class HARCaptureAddon:
         cr.path = req.path
         cr.http_version = getattr(flow, 'http_version', 'HTTP/1.1') or 'HTTP/1.1'
 
-        # Request headers & body
         cr.request_headers = {k: v for k, v in req.headers.items()} if req.headers else {}
         cr.request_body = req.content
         cr.request_body_text = safe_decode(req.content) if req.content else ""
         cr.request_size = len(req.content) if req.content else 0
         cr.request_time = start_time
 
-        # Cookies
         if 'Cookie' in cr.request_headers:
             for part in cr.request_headers['Cookie'].split(';'):
                 if '=' in part:
-                    k, v = part.strip().split('=', 1)
+                    k, v = [x.strip() for x in part.split('=', 1)]
                     cr.request_cookies[k] = v
 
-        # Response
         if resp:
             cr.status_code = resp.status_code
             cr.reason = resp.reason or ""
@@ -128,14 +131,6 @@ class HARCaptureAddon:
             cr.duration = cr.response_time - start_time
             cr.content_type = cr.response_headers.get('Content-Type', '')
             cr.response_body_text = safe_decode(resp.content) if resp.content else ""
-
-            if 'Set-Cookie' in cr.response_headers:
-                for part in cr.response_headers['Set-Cookie'].split(','):
-                    if '=' in part and not part.strip().startswith(('Expires', 'Max-Age')):
-                        kv = part.split(';')[0].strip()
-                        if '=' in kv:
-                            k, v = kv.split('=', 1)
-                            cr.response_cookies[k] = v
 
         return cr
 
@@ -162,7 +157,6 @@ class ProxyEngine:
             return False
 
     def find_available_port(self, max_tries: int = 30) -> int:
-        """Random safe port (10000-65000)"""
         for _ in range(max_tries):
             port = random.randint(10000, 65000)
             if self.is_port_available(port):
@@ -186,7 +180,7 @@ class ProxyEngine:
                 logger.info(f"Port {self.port} busy → using random safe port: {new_port}")
                 self.port = new_port
             else:
-                err = "Tidak menemukan port tersedia di range aman (10000-65000)"
+                err = "Tidak menemukan port tersedia di range aman"
                 logger.error(err)
                 if self.on_error:
                     self.on_error(err)
@@ -218,18 +212,3 @@ class ProxyEngine:
         if self._master:
             self._master.shutdown()
         self._running = False
-
-
-# ==================== CONTOH PENGGUNAAN ====================
-if __name__ == "__main__":
-    def on_flow(captured):
-        print(f"[{captured.method}] {captured.url}")
-
-    engine = ProxyEngine(port=8899, on_flow=on_flow)
-    if engine.start():
-        print(f"Proxy running on port {engine.port}")
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            engine.stop()
