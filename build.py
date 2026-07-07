@@ -55,13 +55,13 @@ build_args = [
 build_args = [arg for arg in build_args if arg]
 
 if __name__ == "__main__":
-    print("🚀 Building Hermes HAR Recorder (Full Mode)...")
-    print("📦 Using one-dir mode for better stability")
+    print("[BUILD] Building Hermes HAR Recorder (Full Mode)...")
+    print("[BUILD] Using one-dir mode for better stability")
     
     result = os.system(" ".join(build_args))
     
     if result == 0:
-        print("✅ Build berhasil!")
-        print("📁 Cek folder: dist/HermesHARRecorder")
+        print("[OK] Build berhasil!")
+        print("[OK] Cek folder: dist/HermesHARRecorder")
     else:
-        print("❌ Build gagal. Coba cek error di atas.")
+        print("[FAIL] Build gagal. Coba cek error di atas.")
