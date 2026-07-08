@@ -32,6 +32,9 @@ build_cmd = [
     "--hidden-import=ssl",
     "--hidden-import=OpenSSL",
     "--hidden-import=cryptography",
+    "--hidden-import=websockets",
+    "--hidden-import=hermes_bridge",
+    "--hidden-import=browser_launcher",
     
     "--collect-all=PyQt6",
     "--collect-all=PyQt6-Qt6",

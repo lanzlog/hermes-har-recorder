@@ -5,3 +5,4 @@ mitmproxy>=10.0.0
 requests>=2.31.0
 cryptography>=41.0.0
 pyinstaller>=6.0.0
+websockets>=12.0
