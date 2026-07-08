@@ -519,7 +519,9 @@ class HARRecorderWindow(QMainWindow):
         self._domains: Set[str] = set()
         self._step_markers: List[Dict] = []
         self._recording = False
+        self._paused = False
         self._app_mode = AppMode.HAR_TRACE  # Combined HAR + Trace mode
+        self._proxy_engine = None  # Long-lived; created on first Record
 
         # Trace engine
         self._trace_engine = TraceEngine()
@@ -566,11 +568,51 @@ class HARRecorderWindow(QMainWindow):
         # ── Toolbar ──
         toolbar_layout = QHBoxLayout()
 
-        self.btn_record = QPushButton("🔴 Record")
-        self.btn_record.setToolTip("Start recording (Ctrl+R)")
-        self.btn_record.setFixedHeight(36)
-        self.btn_record.setStyleSheet("font-weight:bold; padding: 6px 16px;")
-        toolbar_layout.addWidget(self.btn_record)
+        # ── Three record buttons ──
+        #   🔴 Red   = HAR + API Trace   (HAR_TRACE)
+        #   🟢 Green = HAR only          (HAR_RECORD)
+        #   🔵 Blue  = API Trace only    (API_TRACE)
+        self.btn_rec_full = QPushButton("🔴 HAR + API")
+        self.btn_rec_full.setToolTip("Record HAR and trace/intercept API (Ctrl+R)")
+        self.btn_rec_full.setFixedHeight(36)
+        self.btn_rec_full.setStyleSheet(
+            "font-weight:bold; padding: 6px 14px; background-color:#5A2530; color:#FFFFFF;")
+        toolbar_layout.addWidget(self.btn_rec_full)
+
+        self.btn_rec_har = QPushButton("🟢 HAR")
+        self.btn_rec_har.setToolTip("Record HAR only")
+        self.btn_rec_har.setFixedHeight(36)
+        self.btn_rec_har.setStyleSheet(
+            "font-weight:bold; padding: 6px 14px; background-color:#25452B; color:#FFFFFF;")
+        toolbar_layout.addWidget(self.btn_rec_har)
+
+        self.btn_rec_api = QPushButton("🔵 API Trace")
+        self.btn_rec_api.setToolTip("Trace/intercept API only (no HAR logging)")
+        self.btn_rec_api.setFixedHeight(36)
+        self.btn_rec_api.setStyleSheet(
+            "font-weight:bold; padding: 6px 14px; background-color:#213A55; color:#FFFFFF;")
+        toolbar_layout.addWidget(self.btn_rec_api)
+
+        # ── Browser selector: which browser to launch through the proxy ──
+        self.browser_combo = QComboBox()
+        self.browser_combo.setFixedHeight(36)
+        self.browser_combo.setToolTip(
+            "Which browser to open through Hermes.\n"
+            "'System proxy (all apps)' uses the old behavior; picking a\n"
+            "browser launches a clean capture window for just that browser.")
+        toolbar_layout.addWidget(self.browser_combo)
+        self._populate_browser_combo()
+
+        self.btn_pause = QPushButton("⏸ Pause")
+        self.btn_pause.setToolTip(
+            "Pause recording without stopping the session.\n"
+            "Traffic keeps flowing (browser stays usable) but nothing is\n"
+            "captured until you press Continue.")
+        self.btn_pause.setFixedHeight(36)
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setStyleSheet(
+            "font-weight:bold; padding: 6px 14px;")
+        toolbar_layout.addWidget(self.btn_pause)
 
         self.btn_stop = QPushButton("⏹ Stop")
         self.btn_stop.setToolTip("Stop recording (Ctrl+S)")
@@ -755,9 +797,9 @@ class HARRecorderWindow(QMainWindow):
 
         # File menu
         file_menu = menubar.addMenu("File")
-        act_record = QAction("Record", self)
+        act_record = QAction("Record (HAR + API)", self)
         act_record.setShortcut(QKeySequence("Ctrl+R"))
-        act_record.triggered.connect(self._on_record)
+        act_record.triggered.connect(lambda: self._on_record(AppMode.HAR_TRACE))
         file_menu.addAction(act_record)
 
         act_stop = QAction("Stop", self)
@@ -841,7 +883,10 @@ class HARRecorderWindow(QMainWindow):
 
     def _connect_signals(self):
         """Connect signals and slots."""
-        self.btn_record.clicked.connect(self._on_record)
+        self.btn_rec_full.clicked.connect(lambda: self._on_record(AppMode.HAR_TRACE))
+        self.btn_rec_har.clicked.connect(lambda: self._on_record(AppMode.HAR_RECORD))
+        self.btn_rec_api.clicked.connect(lambda: self._on_record(AppMode.API_TRACE))
+        self.btn_pause.clicked.connect(self._on_pause_toggle)
         self.btn_stop.clicked.connect(self._on_stop)
         self.btn_clear.clicked.connect(self._on_clear)
         self.btn_export.clicked.connect(self._on_export)
@@ -1413,56 +1458,168 @@ class HARRecorderWindow(QMainWindow):
     def _init_mode(self):
         """Initialize in combined HAR+Trace mode."""
         self._app_mode = AppMode.HAR_TRACE
-        self._har_view.setVisible(True)
-        self._trace_panel.setVisible(True)
-        self._filter_bar_widget.setVisible(True)
+        self._apply_mode_visibility(self._app_mode)
         self._update_rules_display()
+
+    def _apply_mode_visibility(self, mode: str):
+        """Show/hide panels based on the active record mode.
+
+        HAR_TRACE → both HAR table and trace panel.
+        HAR_RECORD → HAR table only.
+        API_TRACE → trace panel only.
+        """
+        show_har = mode in (AppMode.HAR_TRACE, AppMode.HAR_RECORD)
+        show_trace = mode in (AppMode.HAR_TRACE, AppMode.API_TRACE)
+        self._har_view.setVisible(show_har)
+        self._filter_bar_widget.setVisible(show_har)
+        self._trace_panel.setVisible(show_trace)
+        # In any trace mode, interception must be active to catch requests.
+        if show_trace:
+            self._trace_engine.intercept_enabled = True
+
+    def _populate_browser_combo(self):
+        """Fill the browser selector with detected browsers.
+
+        First item is the legacy 'System proxy (all apps)' option (data=None).
+        Each detected browser is added with its BrowserInfo as item data.
+        """
+        self.browser_combo.clear()
+        self.browser_combo.addItem("🌐 System proxy (all apps)", None)
+        try:
+            from browser_launcher import detect_browsers
+            for b in detect_browsers():
+                self.browser_combo.addItem(f"🚀 {b.name} (clean capture window)", b)
+        except Exception as e:
+            print(f"[Hermes] Browser detection failed: {e}")
 
     # ─── Proxy Control ────────────────────────────────────────────────────────
 
-    def _on_record(self):
-        """Start recording."""
+    def _set_record_buttons_enabled(self, enabled: bool):
+        """Enable/disable all three record buttons at once."""
+        self.btn_rec_full.setEnabled(enabled)
+        self.btn_rec_har.setEnabled(enabled)
+        self.btn_rec_api.setEnabled(enabled)
+
+    def _on_record(self, mode: str = None):
+        """Start recording in the given mode.
+
+        mode is one of AppMode.HAR_TRACE (🔴 red button, HAR + API),
+        AppMode.HAR_RECORD (🟢 green, HAR only) or AppMode.API_TRACE
+        (🔵 blue, API trace only). Defaults to the combined HAR+Trace mode.
+        """
         from proxy_engine import ProxyEngine, set_system_proxy
 
         if self._recording:
             return
 
+        if mode:
+            self._app_mode = mode
+        # Reflect the chosen mode on the proxy panels.
+        self._apply_mode_visibility(self._app_mode)
+
         port = self.config.get("proxy_port", 8899)
 
-        self._proxy_engine = ProxyEngine(
-            port=port,
-            on_flow=self._emit_flow,
-            on_error=lambda e: self.proxy_error.emit(e),
-            trace_engine=self._trace_engine,
-        )
+        # Create the proxy engine once and reuse it. The mitmproxy master is
+        # long-lived (a 2nd master in one process hangs), so Record/Stop just
+        # resume/pause capture on the same engine.
+        if self._proxy_engine is None:
+            self._proxy_engine = ProxyEngine(
+                port=port,
+                on_flow=self._emit_flow,
+                on_error=lambda e: self.proxy_error.emit(e),
+                trace_engine=self._trace_engine,
+            )
 
-        # Set mode on proxy engine
-        self._proxy_engine.set_mode(self._app_mode)
-
-        if self._proxy_engine.start():
+        if self._proxy_engine.start(self._app_mode):
             self._recording = True
+            self._paused = False
             actual_port = self._proxy_engine.port
-            self.btn_record.setEnabled(False)
+            self._set_record_buttons_enabled(False)
             self.btn_stop.setEnabled(True)
-            self.lbl_proxy.setText(f"🟢 Proxy: :{actual_port}")
+            self.btn_pause.setEnabled(True)
+            self.btn_pause.setText("⏸ Pause")
+            mode_label = {
+                AppMode.HAR_TRACE: "HAR + API",
+                AppMode.HAR_RECORD: "HAR",
+                AppMode.API_TRACE: "API Trace",
+            }.get(self._app_mode, "Recording")
+            self.lbl_proxy.setText(f"🟢 Proxy: :{actual_port} [{mode_label}]")
             self.lbl_proxy.setStyleSheet("color: #98C379;")
             if actual_port != port:
                 self.statusBar().showMessage(f"Port {port} busy, using {actual_port}")
             else:
-                self.statusBar().showMessage(f"Recording on port {actual_port}")
+                self.statusBar().showMessage(f"Recording ({mode_label}) on port {actual_port}")
 
-            # Auto-set system proxy on Windows
-            if self.config.get("auto_set_proxy", True):
-                set_system_proxy(actual_port)
+            # Route traffic: either launch a specific browser through the
+            # proxy (recommended, per-browser/profile) or fall back to the
+            # old system-wide proxy behavior.
+            self._route_traffic(actual_port, set_system_proxy)
         else:
-            QMessageBox.warning(self, "Error", 
+            QMessageBox.warning(self, "Error",
                 f"Failed to start proxy on port {port}.\n"
-                f"Port and nearby ports (8899-8918) are all in use.\n\n"
-                f"Try closing other proxy tools or change port in Settings.")
+                f"The port may still be in use by a previous session.\n\n"
+                f"Check the status bar / log for details, close other proxy "
+                f"tools, or change the port in Settings.")
+
+    def _route_traffic(self, actual_port: int, set_system_proxy):
+        """Send browser traffic to the proxy based on the browser selector."""
+        selected = self.browser_combo.currentData()
+        if selected is None:
+            # "System proxy (all apps)" chosen — old behavior.
+            if self.config.get("auto_set_proxy", True):
+                set_system_proxy("127.0.0.1", actual_port)
+                self.statusBar().showMessage(
+                    "System proxy set — all apps route through Hermes.")
+            return
+        # A specific browser was chosen: launch a clean capture window.
+        try:
+            from browser_launcher import launch_browser
+            self._browser_proc = launch_browser(selected, actual_port)
+            self.statusBar().showMessage(
+                f"Launched {selected.name} through Hermes (:{actual_port}). "
+                f"Only this window is captured.")
+        except Exception as e:
+            QMessageBox.warning(self, "Browser launch failed",
+                f"Could not launch {selected.name}:\n{e}\n\n"
+                f"Falling back to system proxy.")
+            if self.config.get("auto_set_proxy", True):
+                set_system_proxy("127.0.0.1", actual_port)
 
     def _emit_flow(self, captured: CapturedRequest):
         """Thread-safe flow emission."""
         self.flow_received.emit(captured)
+
+    def _on_pause_toggle(self):
+        """Pause/continue capture without ending the recording session.
+
+        While paused, traffic still flows through the proxy (the browser
+        keeps working) but nothing is logged or intercepted — useful to
+        keep irrelevant activity out of the HAR (e.g. stepping away).
+        """
+        if not self._recording or self._proxy_engine is None:
+            return
+        if not self._paused:
+            self._proxy_engine.pause()
+            self._paused = True
+            self.btn_pause.setText("▶ Continue")
+            self.lbl_proxy.setText(
+                f"⏸ Proxy: :{self._proxy_engine.port} [PAUSED]")
+            self.lbl_proxy.setStyleSheet("color: #E5C07B;")
+            self.statusBar().showMessage(
+                "Paused — traffic is NOT being recorded. Press Continue to resume.")
+        else:
+            self._proxy_engine.resume()
+            self._paused = False
+            self.btn_pause.setText("⏸ Pause")
+            mode_label = {
+                AppMode.HAR_TRACE: "HAR + API",
+                AppMode.HAR_RECORD: "HAR",
+                AppMode.API_TRACE: "API Trace",
+            }.get(self._app_mode, "Recording")
+            self.lbl_proxy.setText(
+                f"🟢 Proxy: :{self._proxy_engine.port} [{mode_label}]")
+            self.lbl_proxy.setStyleSheet("color: #98C379;")
+            self.statusBar().showMessage("Recording resumed.")
 
     def _on_stop(self):
         """Stop recording."""
@@ -1471,17 +1628,21 @@ class HARRecorderWindow(QMainWindow):
         if not self._recording:
             return
 
-        if hasattr(self, '_proxy_engine'):
+        if self._proxy_engine is not None:
             self._proxy_engine.stop()
 
         self._recording = False
-        self.btn_record.setEnabled(True)
+        self._paused = False
+        self._set_record_buttons_enabled(True)
         self.btn_stop.setEnabled(False)
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setText("⏸ Pause")
         self.lbl_proxy.setText("🔴 Proxy: Off")
         self.lbl_proxy.setStyleSheet("color: #E06C75;")
         self.statusBar().showMessage(f"Stopped. {len(self._flows)} requests captured.")
 
-        if self.config.get("auto_set_proxy", True):
+        # Only unset the system proxy if we actually set it (system mode).
+        if self.browser_combo.currentData() is None and self.config.get("auto_set_proxy", True):
             unset_system_proxy()
 
     def _on_clear(self):
@@ -2212,6 +2373,14 @@ class HARRecorderWindow(QMainWindow):
         # Stop proxy
         if self._recording:
             self._on_stop()
+
+        # Fully tear down the proxy master and release the port on close.
+        if self._proxy_engine is not None:
+            try:
+                self._proxy_engine.shutdown()
+            except Exception:
+                pass
+            self._proxy_engine = None
 
         # Auto-save on close
         if self._flows:

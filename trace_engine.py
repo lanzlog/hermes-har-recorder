@@ -83,6 +83,22 @@ class TraceEngine:
         self._flow_map: Dict[str, Any] = {}  # flow_id -> mitmproxy flow object
         self._lock = threading.Lock()
         self._counter = 0
+        # Callable returning the proxy's asyncio loop (set by ProxyEngine).
+        # mitmproxy flow.resume()/kill() must run on that loop's thread.
+        self._loop_provider: Optional[Callable] = None
+
+    def set_loop_provider(self, provider: Callable):
+        """Register a callable that returns the proxy event loop."""
+        self._loop_provider = provider
+
+    def _run_on_loop(self, fn):
+        """Run a flow operation on the proxy loop thread if available,
+        otherwise run it inline."""
+        loop = self._loop_provider() if self._loop_provider else None
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(fn)
+        else:
+            fn()
 
     def add_rule(self, pattern: str, match_type: str = "contains",
                  method_filter: str = "ALL") -> InterceptRule:
@@ -243,10 +259,10 @@ class TraceEngine:
             self.pending_requests.remove(req)
             self.completed_requests.append(req)
 
-            # Resume the mitmproxy flow
+            # Resume the mitmproxy flow (on the proxy loop thread)
             if flow is not None:
                 try:
-                    flow.resume()
+                    self._run_on_loop(flow.resume)
                 except Exception as e:
                     print(f"[TraceEngine] Error resuming flow: {e}")
                 finally:
@@ -275,10 +291,10 @@ class TraceEngine:
             self.pending_requests.remove(req)
             self.completed_requests.append(req)
 
-            # Kill the mitmproxy flow
+            # Kill the mitmproxy flow (on the proxy loop thread)
             if flow is not None:
                 try:
-                    flow.kill()
+                    self._run_on_loop(flow.kill)
                 except Exception as e:
                     print(f"[TraceEngine] Error killing flow: {e}")
                 finally:
