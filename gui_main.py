@@ -509,6 +509,9 @@ class HARRecorderWindow(QMainWindow):
     replay_complete = pyqtSignal(object, object)  # flow, ReplayResult
     request_intercepted = pyqtSignal(object)  # InterceptedRequest
     request_trace_completed = pyqtSignal(object)  # InterceptedRequest
+    bridge_status = pyqtSignal(bool, str)  # connected, browser
+    bridge_windows = pyqtSignal(str, object)  # browser, List[WindowInfo]
+    bridge_message = pyqtSignal(str)  # status-bar text
 
     def __init__(self, config: dict):
         super().__init__()
@@ -531,6 +534,14 @@ class HARRecorderWindow(QMainWindow):
         self._replay_engine = ReplayEngine(
             on_complete=lambda f, r: self.replay_complete.emit(f, r)
         )
+
+        # Browser-extension bridge: lets us capture already-open browser
+        # windows/tabs (Hermes Capture extension connects here). Optional —
+        # the app works fine without it (falls back to launch/system proxy).
+        self._bridge = None
+        self._live_windows = []  # last window list reported by the extension
+        self._capturing_live = False  # True when the active capture is via ext
+        self._init_bridge()
 
         self._init_ui()
         self._connect_signals()
@@ -1482,6 +1493,8 @@ class HARRecorderWindow(QMainWindow):
 
         First item is the legacy 'System proxy (all apps)' option (data=None).
         Each detected browser is added with its BrowserInfo as item data.
+        Any already-open windows reported by the Hermes Capture extension are
+        appended below with a dict payload {"live": True, "tabId": ...}.
         """
         self.browser_combo.clear()
         self.browser_combo.addItem("🌐 System proxy (all apps)", None)
@@ -1491,6 +1504,81 @@ class HARRecorderWindow(QMainWindow):
                 self.browser_combo.addItem(f"🚀 {b.name} (clean capture window)", b)
         except Exception as e:
             print(f"[Hermes] Browser detection failed: {e}")
+        # Append live windows from the extension (if any).
+        for browser, windows in self._live_windows:
+            for w in windows:
+                for tab in w.tabs:
+                    title = (tab.title or tab.url or "tab")[:45]
+                    self.browser_combo.addItem(
+                        f"🎯 {browser}: {title}",
+                        {"live": True, "tabId": tab.id, "browser": browser})
+
+    # ─── Extension bridge ──────────────────────────────────────────────────────
+    def _init_bridge(self):
+        """Start the WebSocket bridge the Hermes Capture extension connects to."""
+        try:
+            from hermes_bridge import HermesBridge, entry_to_captured
+        except Exception as e:
+            print(f"[Hermes] Extension bridge unavailable: {e}")
+            return
+        self._entry_to_captured = entry_to_captured
+        self.bridge_status.connect(self._on_bridge_status)
+        self.bridge_windows.connect(self._on_bridge_windows)
+        self.bridge_message.connect(lambda m: self.statusBar().showMessage(m))
+        try:
+            self._bridge = HermesBridge(
+                port=self.config.get("bridge_port", 8898),
+                on_status=lambda c, br: self.bridge_status.emit(c, br),
+                on_windows=lambda br, w: self.bridge_windows.emit(br, w),
+                on_entry=self._on_bridge_entry,
+                on_capture_started=lambda t: self.bridge_message.emit(
+                    f"Capturing open window: {t.get('title', '')}"),
+                on_capture_stopped=lambda r: self.bridge_message.emit(
+                    "Extension capture stopped."),
+                on_error=lambda m: self.proxy_error.emit(f"[extension] {m}"),
+            )
+            self._bridge.start()
+        except Exception as e:
+            print(f"[Hermes] Failed to start bridge: {e}")
+            self._bridge = None
+
+    def _on_bridge_entry(self, entry: dict):
+        """Convert an extension network entry to a flow (bridge thread-safe)."""
+        try:
+            captured = self._entry_to_captured(entry)
+            self.flow_received.emit(captured)
+        except Exception as e:
+            self.proxy_error.emit(f"[extension] entry: {e}")
+
+    def _on_bridge_status(self, connected: bool, browser: str):
+        if connected:
+            self.statusBar().showMessage(
+                f"Hermes Capture extension connected ({browser}).")
+            if self._bridge:
+                self._bridge.list_windows()
+        else:
+            # Drop that browser's live windows from the picker.
+            self._live_windows = [
+                (b, w) for (b, w) in self._live_windows if b != browser]
+            self._refresh_browser_combo_preserving()
+
+    def _on_bridge_windows(self, browser: str, windows):
+        # Replace this browser's entry in the cached list.
+        self._live_windows = [
+            (b, w) for (b, w) in self._live_windows if b != browser]
+        self._live_windows.append((browser, windows))
+        self._refresh_browser_combo_preserving()
+
+    def _refresh_browser_combo_preserving(self):
+        """Rebuild the combo but keep the current selection where possible."""
+        prev = self.browser_combo.currentData()
+        self._populate_browser_combo()
+        if isinstance(prev, dict) and prev.get("live"):
+            for i in range(self.browser_combo.count()):
+                d = self.browser_combo.itemData(i)
+                if isinstance(d, dict) and d.get("tabId") == prev.get("tabId"):
+                    self.browser_combo.setCurrentIndex(i)
+                    break
 
     # ─── Proxy Control ────────────────────────────────────────────────────────
 
@@ -1564,6 +1652,20 @@ class HARRecorderWindow(QMainWindow):
     def _route_traffic(self, actual_port: int, set_system_proxy):
         """Send browser traffic to the proxy based on the browser selector."""
         selected = self.browser_combo.currentData()
+        # Live window from the Hermes Capture extension: capture an
+        # already-open tab/window (no browser restart, follows new tabs).
+        if isinstance(selected, dict) and selected.get("live"):
+            if self._bridge and self._bridge.connected:
+                self._capturing_live = True
+                self._bridge.start_capture(tab_id=selected["tabId"], follow_new=True)
+                self.statusBar().showMessage(
+                    "Capturing an already-open window via the extension.")
+            else:
+                QMessageBox.warning(self, "Extension not connected",
+                    "The Hermes Capture extension isn't connected.\n"
+                    "Open the browser, load the extension, then try again.")
+            return
+        self._capturing_live = False
         if selected is None:
             # "System proxy (all apps)" chosen — old behavior.
             if self.config.get("auto_set_proxy", True):
@@ -1600,6 +1702,8 @@ class HARRecorderWindow(QMainWindow):
             return
         if not self._paused:
             self._proxy_engine.pause()
+            if self._capturing_live and self._bridge:
+                self._bridge.pause()
             self._paused = True
             self.btn_pause.setText("▶ Continue")
             self.lbl_proxy.setText(
@@ -1609,6 +1713,8 @@ class HARRecorderWindow(QMainWindow):
                 "Paused — traffic is NOT being recorded. Press Continue to resume.")
         else:
             self._proxy_engine.resume()
+            if self._capturing_live and self._bridge:
+                self._bridge.resume()
             self._paused = False
             self.btn_pause.setText("⏸ Pause")
             mode_label = {
@@ -1630,6 +1736,9 @@ class HARRecorderWindow(QMainWindow):
 
         if self._proxy_engine is not None:
             self._proxy_engine.stop()
+        if self._capturing_live and self._bridge:
+            self._bridge.stop_capture()
+        self._capturing_live = False
 
         self._recording = False
         self._paused = False
@@ -2381,6 +2490,14 @@ class HARRecorderWindow(QMainWindow):
             except Exception:
                 pass
             self._proxy_engine = None
+
+        # Stop the extension bridge.
+        if self._bridge is not None:
+            try:
+                self._bridge.stop()
+            except Exception:
+                pass
+            self._bridge = None
 
         # Auto-save on close
         if self._flows:
