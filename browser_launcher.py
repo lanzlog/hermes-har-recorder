@@ -1,0 +1,150 @@
+"""
+browser_launcher.py - Launch a specific browser through the Hermes proxy.
+
+WHY THIS EXISTS
+---------------
+The old flow set a *system-wide* Windows proxy, so it captured traffic from
+ALL apps and you had to guess which of your many open browsers/profiles was
+being recorded. That is confusing when you run Chrome + Brave + Firefox with
+many profiles every day.
+
+This module instead launches ONE browser window, in an isolated capture
+profile, pointed straight at the Hermes proxy (127.0.0.1:PORT). Only that
+window's traffic goes through Hermes — nothing else on your machine is
+touched. You pick the browser from a dropdown; Hermes opens the window.
+
+Chromium browsers (Chrome / Brave / Edge) honor `--proxy-server` and use the
+Windows system certificate store, so once the mitmproxy CA cert is installed
+HTTPS decryption works. Firefox needs proxy prefs written into a profile and
+has its own cert store (see note in launch_firefox).
+"""
+
+import os
+import sys
+import shutil
+import tempfile
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Optional
+
+
+@dataclass
+class BrowserInfo:
+    key: str            # stable id: "chrome", "brave", "edge", "firefox"
+    name: str           # display name
+    family: str         # "chromium" or "firefox"
+    exe_path: str       # full path to the browser executable
+
+
+# Common install locations on Windows. We check each and keep the ones found.
+_WIN_CANDIDATES = [
+    ("chrome", "Google Chrome", "chromium", [
+        r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+        r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+        r"%LocalAppData%\Google\Chrome\Application\chrome.exe",
+    ]),
+    ("brave", "Brave", "chromium", [
+        r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"%ProgramFiles(x86)%\BraveSoftware\Brave-Browser\Application\brave.exe",
+        r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe",
+    ]),
+    ("edge", "Microsoft Edge", "chromium", [
+        r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
+        r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+    ]),
+    ("firefox", "Firefox", "firefox", [
+        r"%ProgramFiles%\Mozilla Firefox\firefox.exe",
+        r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe",
+    ]),
+]
+
+
+def detect_browsers() -> List[BrowserInfo]:
+    """Return the list of browsers actually installed on this machine."""
+    found: List[BrowserInfo] = []
+    if sys.platform == "win32":
+        for key, name, family, paths in _WIN_CANDIDATES:
+            for raw in paths:
+                expanded = os.path.expandvars(raw)
+                if os.path.isfile(expanded):
+                    found.append(BrowserInfo(key, name, family, expanded))
+                    break
+    else:
+        # Best-effort for dev on macOS/Linux (mainly so the app still runs).
+        for key, name, family, exe in [
+            ("chrome", "Google Chrome", "chromium", "google-chrome"),
+            ("brave", "Brave", "chromium", "brave-browser"),
+            ("firefox", "Firefox", "firefox", "firefox"),
+        ]:
+            path = shutil.which(exe)
+            if path:
+                found.append(BrowserInfo(key, name, family, path))
+    return found
+
+
+def _capture_profile_dir(browser_key: str) -> str:
+    """A dedicated, reusable profile dir for capture sessions.
+
+    Kept in the temp dir and namespaced per browser so cookies/logins from a
+    previous capture persist between sessions but never touch your real
+    browser profiles.
+    """
+    base = Path(tempfile.gettempdir()) / "hermes-capture-profiles" / browser_key
+    base.mkdir(parents=True, exist_ok=True)
+    return str(base)
+
+
+def launch_chromium(browser: BrowserInfo, port: int, host: str = "127.0.0.1",
+                    start_url: str = "") -> subprocess.Popen:
+    """Launch a Chromium-based browser in an isolated profile via the proxy."""
+    profile_dir = _capture_profile_dir(browser.key)
+    args = [
+        browser.exe_path,
+        f"--proxy-server={host}:{port}",
+        # Don't send localhost/127.0.0.1 through the proxy.
+        f'--proxy-bypass-list=<-loopback>',
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+    ]
+    if start_url:
+        args.append(start_url)
+    return subprocess.Popen(args)
+
+
+def launch_firefox(browser: BrowserInfo, port: int, host: str = "127.0.0.1",
+                   start_url: str = "") -> subprocess.Popen:
+    """Launch Firefox in a dedicated profile configured to use the proxy.
+
+    NOTE: Firefox keeps its OWN certificate store, so mitmproxy's CA cert
+    must be imported into this profile (or set
+    security.enterprise_roots.enabled = true, which we do below so Firefox
+    trusts OS-installed roots) for HTTPS decryption to work.
+    """
+    profile_dir = _capture_profile_dir(browser.key)
+    prefs = f"""// Auto-generated by Hermes HAR Recorder
+user_pref("network.proxy.type", 1);
+user_pref("network.proxy.http", "{host}");
+user_pref("network.proxy.http_port", {port});
+user_pref("network.proxy.ssl", "{host}");
+user_pref("network.proxy.ssl_port", {port});
+user_pref("network.proxy.share_proxy_settings", true);
+user_pref("network.proxy.no_proxies_on", "localhost, 127.0.0.1");
+user_pref("security.enterprise_roots.enabled", true);
+user_pref("browser.shell.checkDefaultBrowser", false);
+"""
+    Path(profile_dir, "user.js").write_text(prefs, encoding="utf-8")
+    args = [browser.exe_path, "-profile", profile_dir, "-no-remote", "-new-instance"]
+    if start_url:
+        args.append(start_url)
+    return subprocess.Popen(args)
+
+
+def launch_browser(browser: BrowserInfo, port: int, host: str = "127.0.0.1",
+                   start_url: str = "") -> subprocess.Popen:
+    """Launch the given browser routed through the Hermes proxy."""
+    if browser.family == "firefox":
+        return launch_firefox(browser, port, host, start_url)
+    return launch_chromium(browser, port, host, start_url)
