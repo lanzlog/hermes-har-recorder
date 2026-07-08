@@ -378,6 +378,25 @@ class ProxyEngine:
             except Exception as e:
                 logger.error(f"Error forwarding pending on stop: {e}")
 
+    def pause(self):
+        """Temporarily suspend capture without ending the session.
+
+        Traffic keeps flowing through the proxy (the browser stays usable)
+        but nothing is logged or intercepted until resume() is called.
+        Pending intercepted requests are forwarded so the browser doesn't
+        hang while paused.
+        """
+        self._addon.set_capturing(False)
+        if self._trace_engine is not None:
+            try:
+                self._trace_engine.forward_all()
+            except Exception as e:
+                logger.error(f"Error forwarding pending on pause: {e}")
+
+    def resume(self):
+        """Resume capturing after pause()."""
+        self._addon.set_capturing(True)
+
     def shutdown(self):
         """Fully stop the proxy and release the port (call on app close).
 

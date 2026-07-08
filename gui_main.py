@@ -519,6 +519,7 @@ class HARRecorderWindow(QMainWindow):
         self._domains: Set[str] = set()
         self._step_markers: List[Dict] = []
         self._recording = False
+        self._paused = False
         self._app_mode = AppMode.HAR_TRACE  # Combined HAR + Trace mode
         self._proxy_engine = None  # Long-lived; created on first Record
 
@@ -601,6 +602,17 @@ class HARRecorderWindow(QMainWindow):
             "browser launches a clean capture window for just that browser.")
         toolbar_layout.addWidget(self.browser_combo)
         self._populate_browser_combo()
+
+        self.btn_pause = QPushButton("⏸ Pause")
+        self.btn_pause.setToolTip(
+            "Pause recording without stopping the session.\n"
+            "Traffic keeps flowing (browser stays usable) but nothing is\n"
+            "captured until you press Continue.")
+        self.btn_pause.setFixedHeight(36)
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setStyleSheet(
+            "font-weight:bold; padding: 6px 14px;")
+        toolbar_layout.addWidget(self.btn_pause)
 
         self.btn_stop = QPushButton("⏹ Stop")
         self.btn_stop.setToolTip("Stop recording (Ctrl+S)")
@@ -874,6 +886,7 @@ class HARRecorderWindow(QMainWindow):
         self.btn_rec_full.clicked.connect(lambda: self._on_record(AppMode.HAR_TRACE))
         self.btn_rec_har.clicked.connect(lambda: self._on_record(AppMode.HAR_RECORD))
         self.btn_rec_api.clicked.connect(lambda: self._on_record(AppMode.API_TRACE))
+        self.btn_pause.clicked.connect(self._on_pause_toggle)
         self.btn_stop.clicked.connect(self._on_stop)
         self.btn_clear.clicked.connect(self._on_clear)
         self.btn_export.clicked.connect(self._on_export)
@@ -1519,9 +1532,12 @@ class HARRecorderWindow(QMainWindow):
 
         if self._proxy_engine.start(self._app_mode):
             self._recording = True
+            self._paused = False
             actual_port = self._proxy_engine.port
             self._set_record_buttons_enabled(False)
             self.btn_stop.setEnabled(True)
+            self.btn_pause.setEnabled(True)
+            self.btn_pause.setText("⏸ Pause")
             mode_label = {
                 AppMode.HAR_TRACE: "HAR + API",
                 AppMode.HAR_RECORD: "HAR",
@@ -1573,6 +1589,38 @@ class HARRecorderWindow(QMainWindow):
         """Thread-safe flow emission."""
         self.flow_received.emit(captured)
 
+    def _on_pause_toggle(self):
+        """Pause/continue capture without ending the recording session.
+
+        While paused, traffic still flows through the proxy (the browser
+        keeps working) but nothing is logged or intercepted — useful to
+        keep irrelevant activity out of the HAR (e.g. stepping away).
+        """
+        if not self._recording or self._proxy_engine is None:
+            return
+        if not self._paused:
+            self._proxy_engine.pause()
+            self._paused = True
+            self.btn_pause.setText("▶ Continue")
+            self.lbl_proxy.setText(
+                f"⏸ Proxy: :{self._proxy_engine.port} [PAUSED]")
+            self.lbl_proxy.setStyleSheet("color: #E5C07B;")
+            self.statusBar().showMessage(
+                "Paused — traffic is NOT being recorded. Press Continue to resume.")
+        else:
+            self._proxy_engine.resume()
+            self._paused = False
+            self.btn_pause.setText("⏸ Pause")
+            mode_label = {
+                AppMode.HAR_TRACE: "HAR + API",
+                AppMode.HAR_RECORD: "HAR",
+                AppMode.API_TRACE: "API Trace",
+            }.get(self._app_mode, "Recording")
+            self.lbl_proxy.setText(
+                f"🟢 Proxy: :{self._proxy_engine.port} [{mode_label}]")
+            self.lbl_proxy.setStyleSheet("color: #98C379;")
+            self.statusBar().showMessage("Recording resumed.")
+
     def _on_stop(self):
         """Stop recording."""
         from proxy_engine import unset_system_proxy
@@ -1584,8 +1632,11 @@ class HARRecorderWindow(QMainWindow):
             self._proxy_engine.stop()
 
         self._recording = False
+        self._paused = False
         self._set_record_buttons_enabled(True)
         self.btn_stop.setEnabled(False)
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setText("⏸ Pause")
         self.lbl_proxy.setText("🔴 Proxy: Off")
         self.lbl_proxy.setStyleSheet("color: #E06C75;")
         self.statusBar().showMessage(f"Stopped. {len(self._flows)} requests captured.")
