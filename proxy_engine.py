@@ -1,18 +1,17 @@
 """
-proxy_engine.py - VERSI TERBAIK (Full + 3 Mode)
-Hermes HAR Recorder
+proxy_engine.py - Hermes HAR Recorder proxy core
+mitmproxy 10+ compatible, robust port discovery, long-lived master.
 """
 
 import asyncio
 import logging
-import random
 import socket
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Callable, Dict
+from typing import Optional, Callable, Dict, List
 
 # winreg only exists on Windows. Guard the import so the module can be
 # imported (and unit-tested) on any platform without crashing.
@@ -31,11 +30,13 @@ from utils import safe_decode, get_content_encoding
 # ==================== LOGGER ====================
 _log_dir = Path.home() / ".hermes-har-recorder"
 _log_dir.mkdir(parents=True, exist_ok=True)
+_cert_dir = _log_dir / "certs"
+_cert_dir.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     filename=str(_log_dir / "hermes.log"),
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("hermes.proxy")
 
@@ -101,6 +102,11 @@ class HARCaptureAddon:
     def set_capturing(self, capturing: bool):
         self._capturing = capturing
 
+    def requestheaders(self, flow: mflow.Flow):
+        # Stamp start time as early as possible for accurate duration.
+        if not hasattr(flow, "_har_start_time"):
+            flow._har_start_time = time.time()
+
     def request(self, flow: mflow.Flow):
         if not self._capturing:
             return
@@ -151,13 +157,13 @@ class HARCaptureAddon:
             logger.error(f"Error processing flow: {e}")
 
     def _convert_flow(self, flow: mflow.Flow) -> Optional[CapturedRequest]:
-        if not hasattr(flow, 'request') or not flow.request:
+        if not hasattr(flow, "request") or not flow.request:
             return None
 
         req = flow.request
         resp = flow.response
         self._flow_counter += 1
-        start_time = getattr(flow, '_har_start_time', time.time())
+        start_time = getattr(flow, "_har_start_time", time.time())
 
         cr = CapturedRequest()
         cr.id = f"flow_{self._flow_counter}_{int(start_time * 1000)}"
@@ -165,9 +171,9 @@ class HARCaptureAddon:
         cr.url = req.pretty_url
         cr.scheme = req.scheme
         cr.host = req.host
-        cr.port = req.port or (443 if req.scheme == 'https' else 80)
+        cr.port = req.port or (443 if req.scheme == "https" else 80)
         cr.path = req.path
-        cr.http_version = getattr(flow, 'http_version', 'HTTP/1.1') or 'HTTP/1.1'
+        cr.http_version = getattr(flow, "http_version", "HTTP/1.1") or "HTTP/1.1"
 
         cr.request_headers = {k: v for k, v in req.headers.items()} if req.headers else {}
         cr.request_body = req.content
@@ -175,10 +181,10 @@ class HARCaptureAddon:
         cr.request_size = len(req.content) if req.content else 0
         cr.request_time = start_time
 
-        if 'Cookie' in cr.request_headers:
-            for part in cr.request_headers['Cookie'].split(';'):
-                if '=' in part:
-                    k, v = [x.strip() for x in part.split('=', 1)]
+        if "Cookie" in cr.request_headers:
+            for part in cr.request_headers["Cookie"].split(";"):
+                if "=" in part:
+                    k, v = [x.strip() for x in part.split("=", 1)]
                     cr.request_cookies[k] = v
 
         if resp:
@@ -189,8 +195,18 @@ class HARCaptureAddon:
             cr.response_size = len(resp.content) if resp.content else 0
             cr.response_time = time.time()
             cr.duration = cr.response_time - start_time
-            cr.content_type = cr.response_headers.get('Content-Type', '')
+            cr.content_type = cr.response_headers.get("Content-Type", "")
             cr.response_body_text = safe_decode(resp.content) if resp.content else ""
+
+            # Response cookies
+            set_cookie = cr.response_headers.get("Set-Cookie", "")
+            if set_cookie:
+                for part in set_cookie.split(","):
+                    first = part.split(";", 1)[0]
+                    if "=" in first:
+                        k, v = [x.strip() for x in first.split("=", 1)]
+                        if k:
+                            cr.response_cookies[k] = v
 
         return cr
 
@@ -198,7 +214,8 @@ class HARCaptureAddon:
 class ProxyEngine:
     def __init__(self, port: int = 8899, on_flow: Optional[Callable] = None,
                  on_error: Optional[Callable] = None, trace_engine=None):
-        self.port = port
+        self.port = int(port) if port else 8899
+        self.preferred_port = self.port
         self.on_flow = on_flow
         self.on_error = on_error
         self._master: Optional[DumpMaster] = None
@@ -220,36 +237,64 @@ class ProxyEngine:
 
     @staticmethod
     def is_port_available(port: int) -> bool:
-        """Check whether we can bind the proxy port.
+        """Return True if we can bind the proxy port on IPv4.
 
-        We set SO_REUSEADDR to mirror how mitmproxy actually binds — this
-        avoids false 'busy' results from sockets sitting in TIME_WAIT after
-        a previous session was stopped (a source of the recurring port-busy
-        errors). We also probe the dual-stack ANY address the proxy listens
-        on, not just loopback.
+        Notes / past bugs this fixes:
+        - Do NOT set SO_REUSEADDR on the probe. On Windows that can report a
+          port as free while another process still holds it, which then makes
+          mitmproxy fail to bind and the GUI shows 'port busy' forever.
+        - Probe 127.0.0.1 only (what browsers/proxy clients actually hit).
+          Probing 0.0.0.0 + :: was flaky: IPv6/permission failures on some
+          machines made every port look busy.
         """
-        for family, addr in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
-            try:
-                with socket.socket(family, socket.SOCK_STREAM) as s:
-                    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    s.settimeout(0.5)
-                    s.bind((addr, port))
-            except OSError:
-                return False
-            except Exception:
-                # Some systems lack IPv6; ignore that family.
-                continue
-        return True
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                # Intentionally NO SO_REUSEADDR — we want a real free port.
+                s.bind(("127.0.0.1", int(port)))
+            return True
+        except OSError:
+            return False
+        except Exception:
+            return False
 
-    def find_available_port(self, max_tries: int = 30) -> int:
-        for _ in range(max_tries):
-            port = random.randint(10000, 65000)
+    def find_available_port(self, start: Optional[int] = None,
+                            max_tries: int = 50) -> int:
+        """Find a free port, preferring sequential ports near the preferred one.
+
+        Order:
+          1) preferred/start port
+          2) start+1 .. start+max_tries
+          3) OS-assigned ephemeral port (bind port 0)
+        Returns 0 if nothing works.
+        """
+        base = int(start if start is not None else self.preferred_port or 8899)
+        if base < 1024:
+            base = 8899
+
+        candidates: List[int] = [base]
+        for i in range(1, max_tries + 1):
+            candidates.append(base + i)
+
+        seen = set()
+        for port in candidates:
+            if port in seen or port > 65535:
+                continue
+            seen.add(port)
             if self.is_port_available(port):
                 return port
-        for port in range(50000, 65000):
-            if self.is_port_available(port):
-                return port
-        return 0
+
+        # Last resort: let the OS pick any free port.
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                free = s.getsockname()[1]
+            if free and self.is_port_available(free):
+                return free
+            return free or 0
+        except OSError as e:
+            logger.error(f"OS port allocation failed: {e}")
+            return 0
 
     def _handle_flow(self, captured: CapturedRequest):
         if self.on_flow:
@@ -267,40 +312,75 @@ class ProxyEngine:
         if mode is not None:
             self.set_mode(mode)
 
-        if self._running:
+        if self._running and self._thread is not None and self._thread.is_alive():
             # Master already up (was paused) — just resume capturing.
             self._addon.set_capturing(True)
             return True
 
-        if not self.is_port_available(self.port):
-            new_port = self.find_available_port()
-            if new_port > 0:
-                logger.info(f"Port {self.port} busy → using random safe port: {new_port}")
-                self.port = new_port
-            else:
-                if self.on_error:
-                    self.on_error("Tidak menemukan port tersedia di range aman")
-                return False
+        # Previous thread died / first start — clean stale state.
+        if self._thread is not None and not self._thread.is_alive():
+            self._running = False
+            self._master = None
+            self._loop = None
+            self._thread = None
 
-        # Reset start state before launching the proxy thread.
-        self._start_error = None
-        self._started_event.clear()
+        # Try preferred port, then nearby ports, then OS-assigned.
+        # Retry the whole start a few times because Windows can race us
+        # during TIME_WAIT after a previous unclean exit.
+        last_err = None
+        for attempt in range(3):
+            port = self.find_available_port(
+                start=self.preferred_port + (attempt * 10)
+            )
+            if port <= 0:
+                last_err = "Tidak menemukan port tersedia"
+                continue
 
-        self._thread = threading.Thread(target=self._run_proxy, daemon=True)
-        self._thread.start()
+            self.port = port
+            self._start_error = None
+            self._started_event.clear()
+            self._running = False
 
-        # Wait until the proxy thread reports success or failure (max ~10s).
-        # The thread sets _started_event once it either binds the port or
-        # hits an error, so we no longer poll a plain boolean.
-        if self._started_event.wait(timeout=10.0) and self._running:
-            self._addon.set_capturing(True)
-            return True
+            self._thread = threading.Thread(
+                target=self._run_proxy, daemon=True, name="hermes-proxy"
+            )
+            self._thread.start()
 
-        if self._start_error and self.on_error:
-            self.on_error(self._start_error)
-        elif not self._running and self.on_error:
-            self.on_error("Proxy gagal start (timeout menunggu mitmproxy siap)")
-        return self._running
+            # Wait until the proxy thread reports success or failure (max ~12s).
+            if self._started_event.wait(timeout=12.0) and self._running:
+                self._addon.set_capturing(True)
+                if self.port != self.preferred_port:
+                    logger.info(
+                        f"Port {self.preferred_port} busy → using {self.port}"
+                    )
+                return True
+
+            last_err = self._start_error or "Proxy gagal start"
+            logger.warning(
+                f"Proxy start attempt {attempt + 1} failed on :{port}: {last_err}"
+            )
+
+            # Ensure dead thread is cleaned before next attempt.
+            try:
+                if self._thread is not None and self._thread.is_alive():
+                    # Best-effort: schedule shutdown if loop came up partially.
+                    loop = self._loop
+                    master = self._master
+                    if master is not None and loop is not None and loop.is_running():
+                        loop.call_soon_threadsafe(master.shutdown)
+                    self._thread.join(timeout=3.0)
+            except Exception:
+                pass
+            self._running = False
+            self._master = None
+            self._loop = None
+            self._thread = None
+            time.sleep(0.3)
+
+        msg = last_err or "Proxy gagal start"
+        if self.on_error:
+            self.on_error(msg)
+        return False
 
     def _run_proxy(self):
         """Run mitmproxy inside its own asyncio event loop.
@@ -323,6 +403,17 @@ class ProxyEngine:
             self._started_event.set()
         finally:
             try:
+                # Cancel leftover tasks so loop.close() is clean.
+                pending = asyncio.all_tasks(loop)
+                for t in pending:
+                    t.cancel()
+                if pending:
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+            except Exception:
+                pass
+            try:
                 loop.close()
             except Exception:
                 pass
@@ -331,7 +422,12 @@ class ProxyEngine:
 
     async def _serve(self):
         try:
-            opts = moptions.Options(listen_port=self.port, ssl_insecure=True)
+            opts = moptions.Options(
+                listen_host="127.0.0.1",
+                listen_port=self.port,
+                ssl_insecure=True,
+                confdir=str(_cert_dir),
+            )
             # with_termlog=False keeps mitmproxy from writing to stdout in a
             # windowed .exe (no console) which itself can crash the app.
             self._master = DumpMaster(opts, with_termlog=False, with_dumper=False)
@@ -345,6 +441,7 @@ class ProxyEngine:
 
         self._running = True
         self._started_event.set()
+        logger.info(f"Proxy listening on 127.0.0.1:{self.port}")
         try:
             await self._master.run()
         except OSError as e:
@@ -352,14 +449,15 @@ class ProxyEngine:
             logger.error(f"Proxy bind/run error: {e}")
             self._start_error = f"Port {self.port} tidak bisa dipakai: {e}"
             self._running = False
-            if self.on_error:
-                self.on_error(self._start_error)
+            # Don't call on_error here — start() will surface _start_error and
+            # may still retry another port. Double-emitting confuses the GUI.
         except Exception as e:
             logger.error(f"Proxy run error: {e}")
             self._start_error = str(e)
             self._running = False
-            if self.on_error:
-                self.on_error(str(e))
+        finally:
+            # If run() exits early before waiters saw failure, wake them.
+            self._started_event.set()
 
     def stop(self):
         """Pause capturing (keeps the proxy master alive).
@@ -425,6 +523,7 @@ class ProxyEngine:
         self._running = False
         self._master = None
         self._thread = None
+        self._loop = None
 
 
 def _refresh_wininet():
@@ -444,17 +543,29 @@ def _refresh_wininet():
 
 
 def set_system_proxy(host: str = "127.0.0.1", port: int = 8899):
+    """Set Windows system proxy. Accepts (host, port) OR a single int port
+    for backwards-compat with older GUI call sites that did
+    set_system_proxy(actual_port).
+    """
+    # Back-compat: set_system_proxy(8899) used to pass port as host.
+    if isinstance(host, int) and port == 8899:
+        port = host
+        host = "127.0.0.1"
     if winreg is None:
         logger.warning("set_system_proxy skipped: not on Windows")
         return False
     try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-                             0, winreg.KEY_SET_VALUE)
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            0,
+            winreg.KEY_SET_VALUE,
+        )
         winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
-        winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, f"{host}:{port}")
+        winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, f"{host}:{int(port)}")
         winreg.CloseKey(key)
         _refresh_wininet()
+        logger.info(f"System proxy set to {host}:{port}")
         return True
     except Exception as e:
         logger.error(f"Set system proxy failed: {e}")
@@ -466,12 +577,16 @@ def unset_system_proxy():
         logger.warning("unset_system_proxy skipped: not on Windows")
         return False
     try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-                             0, winreg.KEY_SET_VALUE)
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            0,
+            winreg.KEY_SET_VALUE,
+        )
         winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
         winreg.CloseKey(key)
         _refresh_wininet()
+        logger.info("System proxy disabled")
         return True
     except Exception as e:
         logger.error(f"Unset system proxy failed: {e}")

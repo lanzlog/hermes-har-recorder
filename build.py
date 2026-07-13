@@ -1,20 +1,24 @@
 import os
+import sys
+import subprocess
 from pathlib import Path
 
 os.chdir(Path(__file__).parent)
 
+# Always invoke via the same Python that runs this script. Bare 'pyinstaller'
+# on PATH can point at a different env / missing modules on the Actions runner.
 build_cmd = [
-    "pyinstaller",
+    sys.executable, "-m", "PyInstaller",
     "--name=HermesHARRecorder",
-    "--onedir",                    # <--- ini yang benar
+    "--onedir",
     "--windowed",
     "--clean",
     "--noconfirm",
     "--noupx",
-    
+    # Windows uses ';' as the add-data separator; on other OS it's ':'.
+    # This script is intended for the Windows CI runner.
     "--add-data=README.md;.",
     "--add-data=requirements.txt;.",
-    
     "--hidden-import=PyQt6",
     "--hidden-import=PyQt6.QtCore",
     "--hidden-import=PyQt6.QtGui",
@@ -24,7 +28,7 @@ build_cmd = [
     "--hidden-import=mitmproxy.tools.dump",
     "--hidden-import=mitmproxy.proxy",
     "--hidden-import=mitmproxy.addons",
-    "--hidden-import=mitmproxy.cert",
+    "--hidden-import=mitmproxy.certs",
     "--hidden-import=mitmproxy.connection",
     "--hidden-import=asyncio",
     "--hidden-import=threading",
@@ -35,26 +39,31 @@ build_cmd = [
     "--hidden-import=websockets",
     "--hidden-import=hermes_bridge",
     "--hidden-import=browser_launcher",
-    
+    "--hidden-import=proxy_engine",
+    "--hidden-import=trace_engine",
+    "--hidden-import=export_manager",
+    "--hidden-import=har_formatter",
+    "--hidden-import=replay_engine",
+    "--hidden-import=utils",
     "--collect-all=PyQt6",
     "--collect-all=PyQt6-Qt6",
     "--collect-all=mitmproxy",
     "--collect-all=cryptography",
-    
     "--log-level=WARN",
-    
-    "main.py"
+    "main.py",
 ]
 
+
 if __name__ == "__main__":
-    print("Starting ULTIMATE BUILD Hermes HAR Recorder...")
+    # No emoji — Windows cp1252 console chokes on them and aborts the build.
+    print("Starting build: Hermes HAR Recorder")
     print("Mode: onedir | Full collect | Max hidden imports")
-    
-    result = os.system(" ".join(build_cmd))
-    
+    print("Command:", " ".join(build_cmd))
+    result = subprocess.call(build_cmd)
     if result == 0:
-        print("BUILD BERHASIL!")
-        print("Cek folder: dist/HermesHARRecorder")
-        print("Jalankan: dist/HermesHARRecorder/HermesHARRecorder.exe")
+        print("BUILD OK")
+        print("Output: dist/HermesHARRecorder")
+        print("Run: dist/HermesHARRecorder/HermesHARRecorder.exe")
     else:
-        print("Build gagal. Cek error di atas.")
+        print(f"BUILD FAILED (exit {result})")
+        sys.exit(result)
