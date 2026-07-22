@@ -558,7 +558,11 @@ class HARRecorderWindow(QMainWindow):
     def _init_ui(self):
         """Build the UI."""
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(1200, 800)
+        # Low floor so the dashboard can be scaled down freely on small
+        # screens / side-by-side layouts. Default open size is still large;
+        # last geometry is restored from config when available.
+        self.setMinimumSize(640, 420)
+        self.resize(1280, 820)
 
         # Restore geometry
         geom = self.config.get("window_geometry")
@@ -568,6 +572,10 @@ class HARRecorderWindow(QMainWindow):
                 self.restoreGeometry(QByteArray.fromBase64(geom.encode()))
             except Exception:
                 pass
+        # If a previous session saved a huge minimum into geometry, force
+        # the new floor so the window stays freely resizable.
+        if self.minimumWidth() > 640 or self.minimumHeight() > 420:
+            self.setMinimumSize(640, 420)
 
         # Central widget
         central = QWidget()

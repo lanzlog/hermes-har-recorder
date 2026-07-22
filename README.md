@@ -15,6 +15,7 @@ A desktop HTTP/HTTPS traffic recorder and HAR exporter built with Python, PyQt6,
 - **Export** — HAR 1.2, CSV, JSON, cURL, Python requests, fetch()
 - **Dark Theme** — modern dark UI with colored syntax
 - **Session Management** — auto-save and restore sessions
+- **Resizable dashboard** — min window **640×420** (was 1200×800); free scale + geometry restore
 
 ## Installation
 
